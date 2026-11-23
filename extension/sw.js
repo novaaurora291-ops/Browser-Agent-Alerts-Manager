@@ -9,6 +9,20 @@ async function getEmail() {
   } catch (e) { email = ""; }
   return email;
 }
+// a profile the Manager made with its own user-data-dir is identified by a tag (its first page carries it)
+let tag = null;
+async function getTag() {
+  if (tag !== null) return tag;
+  // per-profile copy of this extension carries tag.json (written by the Manager); fall back to the first-page tag
+  try { const r = await fetch(chrome.runtime.getURL("tag.json")); if (r.ok) { tag = ((await r.json()).tag || "") + ""; if (tag) return tag; } } catch (e) {}
+  try { const r = await chrome.storage.local.get("hbm_tag"); tag = r.hbm_tag || ""; } catch (e) { tag = ""; }
+  return tag;
+}
+chrome.tabs.onUpdated.addListener((_id, info, t) => {
+  const u = info.url || (t && t.url) || "";
+  const m = u.match(/^http:\/\/127\.0\.0\.1:47823\/hbm-tag\?p=([A-Za-z0-9_-]+)/);
+  if (m && m[1] !== tag) { tag = m[1]; chrome.storage.local.set({ hbm_tag: tag }); report().catch(() => {}); }
+});
 async function post(path, body) {
   const r = await fetch(APP + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   return r.json();
@@ -55,6 +69,7 @@ async function report(extra) {
   const wins = await chrome.windows.getAll();
   const body = {
     email: await getEmail(),
+    tag: await getTag(),
     ext_id: chrome.runtime.id,
     ver: chrome.runtime.getManifest().version,
     windows: wins.map(w => ({ id: w.id, focused: w.focused, state: w.state })),

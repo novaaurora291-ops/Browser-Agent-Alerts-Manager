@@ -19,9 +19,29 @@ SETTINGS_PATH = os.path.join(APPDATA, "settings.json")
 ALERTS_PATH = os.path.join(APPDATA, "alerts.json")
 LOG_PATH = os.path.join(APPDATA, "app.log")
 EXTENSION_DIR = os.path.join(LOCALDATA, "bridge_extension")
+# the tool's own folder (next to the EXE, or the source folder when run from source)
+TOOL_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def browser_profiles_dir():
+    """<tool folder>\\BrowserProfiles, or a LocalAppData copy when the tool folder is read-only (e.g. Program Files)."""
+    for base in (TOOL_DIR, LOCALDATA):
+        d = os.path.join(base, "BrowserProfiles")
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".write_test")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+            return d
+        except OSError:
+            continue
+    return os.path.join(LOCALDATA, "BrowserProfiles")
 
 DEFAULTS = {
     "default_browser": "Google Chrome",
+    "browser_exe": "",            # browser used by Add profile (e.g. Cent Browser's chrome.exe); empty = Google Chrome
+    "managed_profiles": [],       # [{id, name, exe, data_dir, created}] profiles with their own user-data-dir
     "preview_refresh": 5,
     "show_previews": True,
     "start_with_windows": False,
@@ -180,6 +200,29 @@ def get_start_with_windows():
             return True
     except OSError:
         return False
+
+
+def ensure_profile_extension(data_dir, tag):
+    """A copy of the bridge extension inside a managed profile's own folder, with tag.json naming the profile,
+    so the Manager knows which profile reports (these profiles have no Google account to match by)."""
+    src = ensure_extension()
+    dst = os.path.join(data_dir, "_hbm_bridge")
+    os.makedirs(dst, exist_ok=True)
+    for fn in os.listdir(src):
+        s = os.path.join(src, fn)
+        if os.path.isfile(s):
+            d = os.path.join(dst, fn)
+            try:
+                if not os.path.exists(d) or open(s, "rb").read() != open(d, "rb").read():
+                    shutil.copy2(s, d)
+            except Exception as e:
+                log(f"profile ext copy {fn}: {e}")
+    t = os.path.join(dst, "tag.json")
+    want = json.dumps({"tag": tag})
+    if not os.path.exists(t) or open(t, encoding="utf-8").read() != want:
+        with open(t, "w", encoding="utf-8") as f:
+            f.write(want)
+    return dst
 
 
 def ensure_extension():

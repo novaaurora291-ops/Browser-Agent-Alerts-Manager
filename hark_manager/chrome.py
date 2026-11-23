@@ -32,6 +32,18 @@ class Profile:
         self.gaia = gaia
         self.avatar = avatar
         self.alias = ""
+        self.kind = "chrome"      # "chrome" = a profile inside Google Chrome's own User Data; "managed" = own user-data-dir
+        self.data_dir = ""
+        self.exe = ""
+        self.tag = ""
+
+    @property
+    def managed(self):
+        return self.kind == "managed"
+
+    @property
+    def browser_name(self):
+        return browser_name(self.exe) if self.managed else "Google Chrome"
 
     @property
     def name(self):
@@ -39,6 +51,8 @@ class Profile:
 
     @property
     def aumids(self):
+        if self.managed:
+            return set()
         d = self.directory.replace(" ", "")
         ids = {f"Chrome.UserData.{d}"}
         if self.directory == "Default":
@@ -69,6 +83,113 @@ def next_profile_dir():
     while os.path.exists(os.path.join(USER_DATA, f"Profile {n}")):
         n += 1
     return f"Profile {n}"
+
+
+# ---------------- managed profiles (own --user-data-dir, any Chromium browser such as Cent Browser) ----------------
+def browser_name(exe):
+    """Product name of a browser exe (e.g. 'Cent Browser'), from its version info; falls back to the file name."""
+    if not exe:
+        return "Google Chrome"
+    try:
+        import win32api
+        lang, cp = win32api.GetFileVersionInfo(exe, "\\VarFileInfo\\Translation")[0]
+        n = win32api.GetFileVersionInfo(exe, f"\\StringFileInfo\\{lang:04x}{cp:04x}\\ProductName")
+        if n:
+            return str(n).strip()
+    except Exception:
+        pass
+    return os.path.splitext(os.path.basename(exe))[0]
+
+
+def detect_cent():
+    for c in (os.path.join(os.environ.get("LOCALAPPDATA", ""), r"CentBrowser\Application\chrome.exe"),
+              os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), r"CentBrowser\Application\chrome.exe"),
+              os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), r"CentBrowser\Application\chrome.exe")):
+        if os.path.exists(c):
+            return c
+    return ""
+
+
+def managed_email(data_dir):
+    """Signed-in account of a managed profile (read-only, from its Local State), if the browser shows one."""
+    try:
+        with open(os.path.join(data_dir, "Local State"), encoding="utf-8") as f:
+            cache = json.load(f).get("profile", {}).get("info_cache", {})
+        v = cache.get("Default") or next(iter(cache.values()), {})
+        return v.get("user_name", "") or ""
+    except Exception:
+        return ""
+
+
+def norm_dir(d):
+    return os.path.normcase(os.path.abspath(d)).rstrip("\\/") if d else ""
+
+
+def launch_managed(p, exe, url=None, new_window=False, ext_dir=None):
+    os.makedirs(p.data_dir, exist_ok=True)
+    args = [exe, f"--user-data-dir={p.data_dir}", "--no-first-run", "--no-default-browser-check"]
+    if ext_dir and os.path.isdir(ext_dir):
+        args.append(f"--load-extension={ext_dir}")
+    if new_window:
+        args.append("--new-window")
+    if url:
+        args.append(url)
+    DETACHED = 0x00000008 | 0x00000200
+    subprocess.Popen(args, creationflags=DETACHED, close_fds=True)
+    log(f"launch managed {p.tag} via {os.path.basename(os.path.dirname(os.path.dirname(exe)))} -> {p.data_dir}")
+
+
+_udd_cache = {}
+
+
+def _proc_udd(pid):
+    """--user-data-dir of a browser process (cached per pid)."""
+    if pid in _udd_cache:
+        return _udd_cache[pid]
+    udd = None
+    try:
+        import psutil
+        for a in psutil.Process(pid).cmdline():
+            if a.startswith("--user-data-dir="):
+                udd = norm_dir(a.split("=", 1)[1].strip('"'))
+                break
+    except Exception:
+        udd = None
+    if len(_udd_cache) > 500:
+        _udd_cache.clear()
+    _udd_cache[pid] = udd
+    return udd
+
+
+def managed_windows(dirs):
+    """Visible top-level browser windows whose process runs with one of our --user-data-dir folders.
+    Returns {normalized dir: [(hwnd, title, "", minimized)]}."""
+    import win32gui
+    import win32process
+    want = {norm_dir(d) for d in dirs if d}
+    out = {}
+    if not want:
+        return out
+
+    def cb(h, _):
+        try:
+            if not win32gui.IsWindowVisible(h) or win32gui.GetClassName(h) != "Chrome_WidgetWin_1":
+                return True
+            if win32gui.GetWindow(h, 4):  # GW_OWNER: popups/menus belong to a browser window
+                return True
+            title = win32gui.GetWindowText(h)
+            if not title:
+                return True
+            _, pid = win32process.GetWindowThreadProcessId(h)
+            udd = _proc_udd(pid)
+            if udd in want:
+                out.setdefault(udd, []).append((h, title, "", bool(win32gui.IsIconic(h))))
+        except Exception:
+            pass
+        return True
+
+    win32gui.EnumWindows(cb, None)
+    return out
 
 
 def launch(profile_dir, url=None, new_window=False):
@@ -115,7 +236,10 @@ def chrome_windows():
     return res
 
 
-def windows_for(profile, wins=None):
+def windows_for(profile, wins=None, mwins=None):
+    if profile.managed:
+        mwins = managed_windows([profile.data_dir]) if mwins is None else mwins
+        return mwins.get(norm_dir(profile.data_dir), [])
     wins = chrome_windows() if wins is None else wins
     ids = profile.aumids
     return [w for w in wins if w[2] in ids]

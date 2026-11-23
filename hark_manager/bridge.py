@@ -40,11 +40,17 @@ class Bridge:
                 self.wfile.write(d)
 
             def do_GET(self):
-                if self.path.startswith("/cmd?") and not self.headers.get("Origin"):
-                    from urllib.parse import parse_qs, urlparse
-                    q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
-                    bridge.queue_command(q.pop("email", ""), q)
-                    return self._reply({"queued": q})
+                if self.path.startswith("/hbm-tag?"):
+                    # first page of a new managed profile: the bridge extension reads the tag from this URL
+                    d = (b"<!doctype html><meta charset=utf-8><meta http-equiv=refresh content='2;url=https://hark.com/'>"
+                         b"<title>Hark Browser Manager</title><body style='font:18px Segoe UI;padding:40px'>"
+                         b"Hark Browser Manager: profile ready. Opening Hark...</body>")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(d)))
+                    self.end_headers()
+                    self.wfile.write(d)
+                    return
                 if self.path.startswith("/ping"):
                     return self._reply({"app": "HarkBrowserManager", "ok": True})
                 self._reply({"error": "not found"}, 404)
@@ -62,16 +68,8 @@ class Bridge:
                 if self.path == "/report":
                     body["_t"] = time.time()
                     bridge.inbox.put(body)
-                    return self._reply({"commands": bridge._take(body.get("email", ""))})
-                if self.path == "/dump":
-                    try:
-                        from .config import APPDATA as APP_DIR
-                        import os
-                        with open(os.path.join(APP_DIR, "dump.jsonl"), "a", encoding="utf-8") as f:
-                            f.write(json.dumps(body, ensure_ascii=False)[:400000] + "\n")
-                    except Exception as e:
-                        log(f"dump write: {e}")
-                    return self._reply({})
+                    cmds = bridge._take(body["tag"]) if body.get("tag") else bridge._take((body.get("email") or "").lower()) + bridge._take(body.get("email", ""))
+                    return self._reply({"commands": cmds})
                 self._reply({"error": "not found"}, 404)
 
         try:

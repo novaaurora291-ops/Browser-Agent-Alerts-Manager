@@ -1,7 +1,8 @@
 """Controller: profiles + live state from the bridge, alert lifecycle, notifications, previews."""
 import threading
+import os
 import time
-EXT_VERSION = "1.0.5"
+EXT_VERSION = "1.0.6"
 ALERT_GRACE = 15  # an alert Hark no longer shows as waiting (live DOM) is cleared after this many seconds
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -38,6 +39,7 @@ class Controller(QObject):
         self.bridge_ok = self.bridge.start()
         self.profiles = []
         self.by_email = {}
+        self.by_tag = {}
         self.state = {}       # profile_dir -> {"t":..., "tabs":[...], "hark":{tabId: state}}
         self.windows = {}     # profile_dir -> [(hwnd,title,aumid,minimized)]
         self.previews = {}    # profile_dir -> png bytes
@@ -67,9 +69,46 @@ class Controller(QObject):
         aliases = self.settings["aliases"] or {}
         for p in ps:
             p.alias = aliases.get(p.directory, "")
-        self.profiles = ps
+        managed = []
+        for m in self.settings["managed_profiles"] or []:
+            p = chrome.Profile("hbm:" + m["id"], m.get("name") or m["id"])
+            p.kind, p.tag, p.data_dir, p.exe = "managed", m["id"], m["data_dir"], m.get("exe", "")
+            p.email = chrome.managed_email(p.data_dir)
+            p.alias = aliases.get(p.directory, "")
+            managed.append(p)
+        self.profiles = ps + managed
+        # bridge reports: Chrome profiles are matched by their Google account, managed ones by their own tag
         self.by_email = {p.email.lower(): p for p in ps if p.email}
+        self.by_tag = {p.tag: p for p in managed}
         self.changed.emit()
+
+    def bridge_key(self, p):
+        return p.tag if p.managed else (p.email or "").lower()
+
+    def browser_exe(self):
+        exe = (self.settings["browser_exe"] or "").strip().strip('"')
+        return exe if exe and os.path.isfile(exe) else ""
+
+    def exe_for(self, p):
+        """A managed profile keeps the browser it was made with; if that exe is gone, the current Settings browser."""
+        if p.exe and os.path.isfile(p.exe):
+            return p.exe
+        return self.browser_exe() or chrome.chrome_exe()
+
+    def open_in(self, p, url=None, new_window=False):
+        if p.managed:
+            m = self._managed_rec(p.tag) or {}
+            if not m.get("tagged") and not url:
+                url = "https://hark.com/"
+            chrome.launch_managed(p, self.exe_for(p), url, new_window, config.ensure_profile_extension(p.data_dir, p.tag))
+        else:
+            chrome.launch(p.directory, url, new_window)
+
+    def _managed_rec(self, tag):
+        for m in self.settings["managed_profiles"] or []:
+            if m["id"] == tag:
+                return m
+        return None
 
     def profile(self, directory):
         for p in self.profiles:
@@ -108,7 +147,12 @@ class Controller(QObject):
         except Exception as e:
             log(f"windows: {e}")
             return
-        new = {p.directory: chrome.windows_for(p, wins) for p in self.profiles}
+        try:
+            mwins = chrome.managed_windows([p.data_dir for p in self.profiles if p.managed])
+        except Exception as e:
+            log(f"managed windows: {e}")
+            mwins = {}
+        new = {p.directory: chrome.windows_for(p, wins, mwins) for p in self.profiles}
         sig = lambda d: {k: [w[0] for w in v] for k, v in d.items()}
         if sig(new) != sig(self.windows):
             self.windows = new
@@ -160,17 +204,24 @@ class Controller(QObject):
 
     def handle_report(self, rep):
         email = (rep.get("email") or "").lower()
-        p = self.by_email.get(email)
+        tag = rep.get("tag") or ""
+        p = self.by_tag.get(tag) if tag else self.by_email.get(email)
         if not p:
             self.reload_profiles()
-            p = self.by_email.get(email)
+            p = self.by_tag.get(tag) if tag else self.by_email.get(email)
         if not p:
             return False
+        if p.managed:
+            m = self._managed_rec(p.tag)
+            if m and not m.get("tagged"):
+                m["tagged"] = True
+                self.settings.save()
+                log(f"managed profile {p.tag} bridge connected")
         st = self.state.setdefault(p.directory, {"t": 0, "tabs": [], "hark": {}, "email": email})
         # an older bridge copy is running in this profile: ask it to reload itself (at most once a minute)
         if rep.get("ver") != EXT_VERSION and time.time() - st.get("reload_asked", 0) > 60:
             st["reload_asked"] = time.time()
-            self.bridge.queue_command(email, {"type": "reload_ext"})
+            self.bridge.queue_command(self.bridge_key(p), {"type": "reload_ext"})
             log(f"bridge in {p.directory} is {rep.get('ver')}, asked to reload to {EXT_VERSION}")
         if time.time() - st["t"] >= STALE:
             st["live_since"] = time.time()  # bridge (re)connected: give alerts a fresh grace window
@@ -320,11 +371,11 @@ class Controller(QObject):
     def focus_profile(self, p):
         if chrome.focus_profile(p):
             return True
-        chrome.launch(p.directory)
+        self.open_in(p)
         return False
 
     def launch(self, p):
-        chrome.launch(p.directory, new_window=bool(self.windows.get(p.directory)))
+        self.open_in(p, new_window=bool(self.windows.get(p.directory)))
         QTimer.singleShot(1500, self.refresh_windows)
 
     def open_task(self, a):
@@ -333,26 +384,49 @@ class Controller(QObject):
             return
         url = a["conv_url"] or "https://hark.com/chat"
         if self.bridge_live(p):
-            self.bridge.queue_command(p.email.lower(), {"type": "open_task", "url": url})
+            self.bridge.queue_command(self.bridge_key(p), {"type": "open_task", "url": url})
             # the extension activates the tab on its next report; bring the window up as well
             for delay in (600, 2500, 5000):
                 QTimer.singleShot(delay, lambda p=p: chrome.focus_profile(p, prefer_title="Hark"))
         else:
-            chrome.launch(p.directory, url)
+            self.open_in(p, url)
             QTimer.singleShot(2500, lambda p=p: chrome.focus_profile(p, prefer_title="Hark"))
         log(f"open_task {a['qid']} -> {p.directory} {url}")
 
     def add_profile(self, name):
-        d = chrome.next_profile_dir()
-        if name:
-            al = dict(self.settings["aliases"] or {})
-            al[d] = name
-            self.settings["aliases"] = al
-            self.settings.save()
-        chrome.launch(d, "https://hark.com/")
-        for delay in (4000, 9000):
-            QTimer.singleShot(delay, self.reload_profiles)
-        return d
+        """With a browser set in Settings: a new profile with its own user-data-dir in <tool>\\BrowserProfiles.
+        Without one: the old way, a new profile inside Google Chrome."""
+        exe = self.browser_exe()
+        if not exe:
+            d = chrome.next_profile_dir()
+            if name:
+                al = dict(self.settings["aliases"] or {})
+                al[d] = name
+                self.settings["aliases"] = al
+                self.settings.save()
+            chrome.launch(d, "https://hark.com/")
+            for delay in (4000, 9000):
+                QTimer.singleShot(delay, self.reload_profiles)
+            return {"kind": "chrome", "dir": d, "browser": "Google Chrome"}
+        import re
+        import uuid
+        recs = list(self.settings["managed_profiles"] or [])
+        n = len(recs) + 1
+        name = name or f"{chrome.browser_name(exe)} {n}"
+        pid = uuid.uuid4().hex[:6]
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-")[:32] or "Profile"
+        root = config.browser_profiles_dir()
+        data_dir = os.path.join(root, f"{slug}_{pid}")
+        os.makedirs(data_dir, exist_ok=False)
+        rec = {"id": pid, "name": name, "exe": exe, "data_dir": data_dir, "created": time.time()}
+        recs.append(rec)
+        self.settings["managed_profiles"] = recs
+        self.settings.save()
+        log(f"managed profile created {pid} '{name}' -> {data_dir}")
+        self.reload_profiles()
+        self.open_in(self.profile("hbm:" + pid))
+        QTimer.singleShot(2500, self.refresh_windows)
+        return {"kind": "managed", "dir": data_dir, "browser": chrome.browser_name(exe), "name": name}
 
     def rename(self, p, name):
         al = dict(self.settings["aliases"] or {})

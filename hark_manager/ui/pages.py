@@ -1,9 +1,10 @@
+import os
 import time
 
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox, QPushButton,
                                QScrollArea, QFrame, QMenu, QInputDialog, QButtonGroup, QLineEdit, QMessageBox,
-                               QSizePolicy, QApplication)
+                               QSizePolicy, QApplication, QFileDialog)
 
 from . import icons
 from .widgets import card, label, button, StatusLabel, Toggle, SearchBox, Preview, IconLabel, Dot
@@ -38,7 +39,7 @@ class ProfileCard(QFrame):
         v.setSpacing(8)
         top = QHBoxLayout()
         self.name = label(p.name, size=21, bold=True)
-        self.name.setToolTip(f"{p.chrome_name} • {p.email or 'not signed in'} • {p.directory}")
+        self.name.setToolTip(f"{p.browser_name} • {p.email or 'not signed in'} • {p.data_dir if p.managed else p.directory}")
         top.addWidget(self.name, 1)
         self.dots = QPushButton("•••")
         self.dots.setObjectName("dots")
@@ -87,10 +88,11 @@ class ProfileCard(QFrame):
         m = QMenu(self)
         m.addAction("Launch new window", lambda: c.launch(self.p))
         m.addAction("Focus window", lambda: c.focus_profile(self.p))
-        m.addAction("Open Hark", lambda: chrome_mod.launch(self.p.directory, "https://hark.com/chat"))
+        m.addAction("Open Hark", lambda: c.open_in(self.p, "https://hark.com/chat"))
         m.addSeparator()
         m.addAction("Rename…", self.rename)
-        m.addAction("Install Hark bridge…", lambda: self.page.install_bridge.emit(self.p.directory))
+        if not self.p.managed:
+            m.addAction("Install Hark bridge…", lambda: self.page.install_bridge.emit(self.p.directory))
         m.addAction("Hide from list", self.hide_profile)
         m.exec(self.dots.mapToGlobal(self.dots.rect().bottomLeft()))
 
@@ -319,10 +321,21 @@ class ProfilesPage(QWidget):
         self._update_cols()
 
     def add_profile(self):
-        name, ok = QInputDialog.getText(self, "Add profile", "Naye Chrome profile ka naam:")
-        if ok:
-            d = self.ctl.add_profile(name.strip())
-            QMessageBox.information(self, "Add profile", f"Chrome mein naya profile ({d}) khul raha hai. Wahan Google/Hark mein sign in kar lein; ye list mein khud aa jayega.")
+        exe = self.ctl.browser_exe()
+        bname = chrome_mod.browser_name(exe) if exe else "Google Chrome"
+        name, ok = QInputDialog.getText(self, "Add profile", f"Naye {bname} profile ka naam:")
+        if not ok:
+            return
+        try:
+            r = self.ctl.add_profile(name.strip())
+        except Exception as e:
+            QMessageBox.warning(self, "Add profile", f"Profile nahi ban saka: {e}")
+            return
+        if r["kind"] == "managed":
+            self.rebuild()
+            QMessageBox.information(self, "Add profile", f"{r['browser']} mein naya profile \"{r['name']}\" ban gaya aur khul raha hai.\n\nData folder:\n{r['dir']}")
+        else:
+            QMessageBox.information(self, "Add profile", f"Chrome mein naya profile ({r['dir']}) khul raha hai. Wahan Google/Hark mein sign in kar lein; ye list mein khud aa jayega.")
 
 
 # ======================= Alerts =======================
@@ -482,7 +495,7 @@ def row(text, widget, line=True):
     l.setMinimumWidth(110)
     h.addWidget(l)
     h.addSpacing(12)
-    if isinstance(widget, (QLineEdit, QComboBox)):
+    if isinstance(widget, (QLineEdit, QComboBox)) or widget.property("expand"):
         widget.setMinimumWidth(150)
         widget.setMaximumWidth(16777215)
         widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -542,15 +555,30 @@ class SettingsPage(QWidget):
 
         # Browser & previews
         c1, v1 = section("Browser & previews")
-        self.browser = QComboBox()
-        self.browser.addItems(["Google Chrome"])
-        self.browser.setMinimumWidth(150)
+        self.exe = QLineEdit()
+        self.exe.setPlaceholderText("Khali = Google Chrome")
+        self.exe.setMinimumHeight(38)
+        self.exe.textChanged.connect(self._exe_hint)
+        self.browse = button("Browse…", "outline")
+        self.browse.setMinimumHeight(38)
+        self.browse.clicked.connect(self.pick_exe)
+        exe_w = QWidget()
+        eh = QHBoxLayout(exe_w)
+        eh.setContentsMargins(0, 0, 0, 0)
+        eh.setSpacing(8)
+        eh.addWidget(self.exe, 1)
+        eh.addWidget(self.browse)
+        exe_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.exe_hint = label("", size=13, color="#5B616B")
+        self.exe_hint.setWordWrap(True)
         self.refresh_cb = QComboBox()
         self.refresh_cb.addItems(["2 seconds", "5 seconds", "10 seconds", "30 seconds", "60 seconds"])
         self.refresh_cb.setMinimumWidth(150)
         self.t_prev = Toggle()
         v1.addSpacing(8)
-        v1.addWidget(row("Default browser", self.browser)); v1.addWidget(hline())
+        exe_w.setProperty("expand", True)
+        v1.addWidget(row("Browser EXE Path", exe_w))
+        v1.addWidget(self.exe_hint); v1.addWidget(hline())
         v1.addWidget(row("Preview refresh", self.refresh_cb)); v1.addWidget(hline())
         v1.addWidget(row("Show browser previews", self.t_prev))
         v1.addStretch(1)
@@ -645,7 +673,8 @@ class SettingsPage(QWidget):
 
     def load(self):
         s = self.ctl.settings
-        self.browser.setCurrentText(s["default_browser"])
+        self.exe.setText(s["browser_exe"] or "")
+        self._exe_hint()
         self.refresh_cb.setCurrentText(f"{s['preview_refresh']} seconds")
         self.t_prev.setChecked(bool(s["show_previews"]))
         self.t_tg.setChecked(bool(s["telegram_enabled"]))
@@ -673,12 +702,32 @@ class SettingsPage(QWidget):
         self.test_res.setText("")
         self.on_tg(self.ctl.tg_ok, self.ctl.tg_msg)
 
+    def pick_exe(self):
+        start = os.path.dirname(self.exe.text().strip()) or chrome_mod.detect_cent() or os.environ.get("LOCALAPPDATA", "C:\\")
+        f, _ = QFileDialog.getOpenFileName(self, "Browser EXE chunein", start, "Browser (*.exe)")
+        if f:
+            self.exe.setText(os.path.normpath(f))
+
+    def _exe_hint(self):
+        exe = self.exe.text().strip().strip('"')
+        if not exe:
+            self.exe_hint.setText("Add profile: Google Chrome ke andar naya profile (purana tareeqa).")
+        elif os.path.isfile(exe):
+            self.exe_hint.setText(f"Add profile: {chrome_mod.browser_name(exe)}, har profile ka alag folder: {config.browser_profiles_dir()}")
+        else:
+            self.exe_hint.setText("Yeh file nahi mili.")
+
     def current_token(self):
         return self.token.text().strip() or config.get_bot_token()
 
     def save(self):
         s = self.ctl.settings
-        s["default_browser"] = self.browser.currentText()
+        exe = self.exe.text().strip().strip('"')
+        if exe and not (os.path.isfile(exe) and exe.lower().endswith(".exe")):
+            QMessageBox.warning(self, "Browser EXE Path", "Yeh .exe file nahi mili. Browse karke browser ki exe chunein.")
+            return
+        s["browser_exe"] = exe
+        s["default_browser"] = chrome_mod.browser_name(exe) if exe else "Google Chrome"
         s["preview_refresh"] = int(self.refresh_cb.currentText().split()[0])
         s["show_previews"] = self.t_prev.isChecked()
         s["telegram_enabled"] = self.t_tg.isChecked()
