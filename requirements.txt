@@ -1,0 +1,8 @@
+PySide6>=6.7
+pywin32
+psutil
+keyring
+pywinauto
+pillow
+requests
+pyperclip
