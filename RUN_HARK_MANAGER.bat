@@ -22,7 +22,7 @@ if errorlevel 1 (
 )
 
 rem start without a console window
-for /f "delims=" %%i in (where pythonw 2^>nul) do (
+for /f "delims=" %%i in ('where pythonw 2^>nul') do (
   start "" "%%i" "%~dp0run.py"
   exit /b 0
 )
