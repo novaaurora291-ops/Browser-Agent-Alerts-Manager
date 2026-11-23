@@ -1,6 +1,6 @@
 import time
 
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox, QPushButton,
                                QScrollArea, QFrame, QMenu, QInputDialog, QButtonGroup, QLineEdit, QMessageBox,
                                QSizePolicy, QApplication)
@@ -32,7 +32,7 @@ class ProfileCard(QFrame):
         super().__init__()
         self.page, self.p = page, p
         self.setObjectName("card")
-        self.setMinimumSize(300, 345)
+        self.setMinimumSize(260, 345)
         v = QVBoxLayout(self)
         v.setContentsMargins(16, 12, 16, 14)
         v.setSpacing(8)
@@ -154,17 +154,17 @@ class ProfilesPage(QWidget):
         v.setContentsMargins(24, 22, 24, 10)
         v.setSpacing(18)
         v.addWidget(label("Browser profiles", obj="h1"))
-        bar = QHBoxLayout()
-        bar.setSpacing(18)
+        self.bar = QGridLayout()
+        self.bar.setHorizontalSpacing(18)
+        self.bar.setVerticalSpacing(12)
         self.search = SearchBox("Search profiles")
         self.search.textChanged.connect(self.rebuild)
-        bar.addWidget(self.search, 3)
+        self.search.setMinimumWidth(160)
         self.filter = QComboBox()
         self.filter.addItems(["All statuses", "Working", "Needs reply", "Idle", "Closed"])
         self.filter.setMinimumHeight(42)
-        self.filter.setMinimumWidth(200)
+        self.filter.setMinimumWidth(150)
         self.filter.currentIndexChanged.connect(self.rebuild)
-        bar.addWidget(self.filter, 2)
         seg = QHBoxLayout()
         seg.setSpacing(0)
         self.bgrid = QPushButton()
@@ -184,14 +184,17 @@ class ProfilesPage(QWidget):
         (self.blist if ctl.settings["view_mode"] == "list" else self.bgrid).setChecked(True)
         self.bgrid.clicked.connect(lambda: self.set_mode("grid"))
         self.blist.clicked.connect(lambda: self.set_mode("list"))
-        bar.addLayout(seg)
-        bar.addStretch(1)
+        self.seg = QWidget()
+        self.seg.setLayout(seg)
+        seg.setContentsMargins(0, 0, 0, 0)
         add = button("  Add profile", "primary", "plus", 20)
         add.setMinimumHeight(46)
         add.setStyleSheet("font-size:17px; padding: 8px 26px;")
         add.clicked.connect(self.add_profile)
-        bar.addWidget(add)
-        v.addLayout(bar)
+        self.addbtn = add
+        self._bar_narrow = None
+        self._layout_bar(False)
+        v.addLayout(self.bar)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.holder = QWidget()
@@ -199,6 +202,8 @@ class ProfilesPage(QWidget):
         self.grid.setContentsMargins(0, 0, 6, 10)
         self.grid.setSpacing(18)
         self.scroll.setWidget(self.holder)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.viewport().installEventFilter(self)
         v.addWidget(self.scroll, 1)
         self.cols = 3
         ctl.changed.connect(self.refresh)
@@ -208,6 +213,7 @@ class ProfilesPage(QWidget):
     def set_mode(self, m):
         self.ctl.settings["view_mode"] = m
         self.ctl.settings.save()
+        self.cols = self._calc_cols()
         self.rebuild()
 
     def visible_profiles(self):
@@ -248,8 +254,10 @@ class ProfilesPage(QWidget):
             w.refresh()
         if not ps:
             self.grid.addWidget(label("Koi profile nahi mila.", obj="muted"), 0, 0)
-        for c in range(3):
-            self.grid.setColumnStretch(c, 1 if mode == "grid" else (1 if c == 0 else 0))
+        ncols = self.cols if mode == "grid" else 1
+        for c in range(8):
+            # only real columns stretch (equal widths); empty columns must not eat space
+            self.grid.setColumnStretch(c, 1 if c < ncols else 0)
         self.grid.setRowStretch(self.grid.rowCount(), 1)
 
     def refresh(self):
@@ -258,12 +266,57 @@ class ProfilesPage(QWidget):
         for w in self.items.values():
             w.refresh()
 
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        cols = max(1, min(4, (self.scroll.viewport().width() + 18) // 318))
+    CARD_MIN = 260
+    GAP = 18
+
+    def _calc_cols(self):
+        w = self.scroll.viewport().width() - 6  # grid right margin
+        return max(1, min(4, (w + self.GAP) // (self.CARD_MIN + self.GAP)))
+
+    def _layout_bar(self, narrow):
+        if narrow == self._bar_narrow:
+            return
+        self._bar_narrow = narrow
+        for w in (self.search, self.filter, self.seg, self.addbtn):
+            self.bar.removeWidget(w)
+        for c in range(5):
+            self.bar.setColumnStretch(c, 0)
+        if narrow:  # two rows: search full width, then filter + view + add
+            self.bar.addWidget(self.search, 0, 0, 1, 4)
+            self.bar.addWidget(self.filter, 1, 0)
+            self.bar.addWidget(self.seg, 1, 1)
+            self.bar.addWidget(self.addbtn, 1, 3)
+            self.bar.setColumnStretch(0, 1)
+            self.bar.setColumnStretch(2, 0)
+        else:
+            self.bar.addWidget(self.search, 0, 0)
+            self.bar.addWidget(self.filter, 0, 1)
+            self.bar.addWidget(self.seg, 0, 2)
+            self.bar.addWidget(self.addbtn, 0, 4)
+            self.bar.setColumnStretch(0, 3)
+            self.bar.setColumnStretch(1, 2)
+            self.bar.setColumnStretch(3, 1)
+
+    def _update_cols(self):
+        self._layout_bar(self.width() < 900)
+        cols = self._calc_cols()
         if cols != self.cols:
             self.cols = cols
-            self.rebuild()
+            if self.ctl.settings["view_mode"] == "grid":
+                self.rebuild()
+
+    def eventFilter(self, obj, e):
+        if obj is self.scroll.viewport() and e.type() == QEvent.Resize:
+            self._update_cols()
+        return super().eventFilter(obj, e)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._update_cols()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._update_cols()
 
     def add_profile(self):
         name, ok = QInputDialog.getText(self, "Add profile", "Naye Chrome profile ka naam:")
