@@ -22,7 +22,9 @@ from .config import log
 BROWSEC_ID = "omghfjlpggmjjaagoclmmobgdodcjboh"
 BROWSEC_URL = "https://chromewebstore.google.com/detail/browsec-vpn-free-vpn-for/omghfjlpggmjjaagoclmmobgdodcjboh"
 POPUP = f"chrome-extension://{BROWSEC_ID}/popup/popup.html"
-IPCHECK = "https://ipinfo.io/json"
+# several public "what is my IP" services; shared VPN exits often hit one service's rate limit
+IPCHECKS = [("https://ipinfo.io/json", "country", "ip"), ("https://api.country.is/", "country", "ip"),
+            ("https://ipwho.is/", "country_code", "ip"), ("https://ipapi.co/json/", "country_code", "ip")]
 
 # deep query through open shadow roots (Browsec's popup is built from web components)
 DEEP = """window.__deep=(sel)=>{const res=[];const walk=r=>{r.querySelectorAll('*').forEach(e=>{if(e.matches(sel))res.push(e);if(e.shadowRoot)walk(e.shadowRoot)})};walk(document);return res};true"""
@@ -261,14 +263,21 @@ class ProfileSetup(QObject):
 
     # ---------- step 2: VPN ----------
     def _ip(self, s):
-        s.call("Page.navigate", {"url": IPCHECK})
-        self._sleep(3)
-        r = s.js("document.body ? document.body.innerText : ''") or ""
-        try:
-            j = json.loads(r)
-            return j.get("country", ""), j.get("ip", "")
-        except Exception:
-            return "", ""
+        for url, ck, ik in IPCHECKS:
+            try:
+                s.call("Page.navigate", {"url": url})
+                self._sleep(2.5)
+                r = s.js("document.body ? document.body.innerText : ''") or ""
+                j = json.loads(r)
+                c = (j.get(ck) or "").upper()
+                if len(c) == 2:
+                    return c, j.get(ik, "")
+                log(f"setup {self.p.tag}: ip check {url} gave no country")
+            except Stop:
+                raise
+            except Exception:
+                continue
+        return "", ""
 
     def connect_vpn(self):
         self._say(2, "run", "Browsec mein United States chun raha hoon…")
