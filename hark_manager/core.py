@@ -1,7 +1,7 @@
 """Controller: profiles + live state from the bridge, alert lifecycle, notifications, previews."""
 import threading
 import time
-EXT_VERSION = "1.0.2"
+EXT_VERSION = "1.0.4"
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -11,6 +11,15 @@ from .bridge import Bridge
 from .config import Settings, get_bot_token, log
 
 STALE = 20  # seconds without a report = bridge not live for that profile
+
+
+def conv_key(url):
+    """Stable id of a Hark conversation: project:<uuid> or chat."""
+    import re
+    m = re.search(r"hark\.com/project/([0-9a-fA-F-]{8,})", url or "")
+    if m:
+        return "project:" + m.group(1).lower()
+    return "chat"
 
 
 class Controller(QObject):
@@ -62,13 +71,28 @@ class Controller(QObject):
                 return p
         return None
 
+    def live_tabs(self, p):
+        st = self.state.get(p.directory)
+        if not st or time.time() - st["t"] >= STALE:
+            return []
+        return list(st["hark"].values())
+
     def status(self, p):
-        if any(a["profile_dir"] == p.directory for a in self.alerts.open_alerts()):
+        tabs = self.live_tabs(p)
+        open_ = [a for a in self.alerts.open_alerts() if a["profile_dir"] == p.directory]
+        # what Hark itself shows wins: a running task (Working badge / live pill / "Waiting for your task
+        # to finish") means Working, unless another conversation genuinely waits on the user
+        working_convs = {conv_key(h.get("url", "")) for h in tabs if h.get("working")}
+        for h in tabs:
+            working_convs.update("project:" + r for r in (h.get("running") or []))
+        waiting = [a for a in open_ if conv_key(a.get("conv_url", "")) not in working_convs]
+        if working_convs and not waiting:
+            return "Working"
+        if waiting:
             return "Needs reply"
         if not self.windows.get(p.directory):
             return "Closed"
-        st = self.state.get(p.directory)
-        if st and time.time() - st["t"] < STALE and any(h.get("working") for h in st["hark"].values()):
+        if working_convs:
             return "Working"
         return "Idle"
 
@@ -156,19 +180,43 @@ class Controller(QObject):
             prev = st["hark"].get(h["tabId"])
             st["hark"][h["tabId"]] = h
             changed = prev != h
+            sig = (h.get("working"), h.get("pending"), h.get("optional"), h.get("qid"))
+            if not prev or sig != (prev.get("working"), prev.get("pending"), prev.get("optional"), prev.get("qid")):
+                log(f"state {p.name} {conv_key(h.get('url',''))} working={h.get('working')} why={h.get('workWhy')} "
+                    f"pending={h.get('pending')} optional={h.get('optional')} q={(h.get('question') or '')[:60]!r}")
             self.process_hark_state(p, h)
-        # resolve alerts whose conversation tab now shows no open question / a different question
+        # alerts follow the state of THEIR OWN conversation (matched by profile + conversation)
+        tabs = list(st["hark"].values())
+        running = set()
+        for v in tabs:
+            running.update("project:" + r for r in (v.get("running") or []))
         for a in self.alerts.open_alerts():
             if a["profile_dir"] != p.directory:
                 continue
-            # Resolved only when the page shows a user reply after this exact question
-            if any(a["qid"] in (v.get("answered") or []) for v in st["hark"].values()):
-                if self.alerts.resolve(a, "answered in Hark"):
-                    changed = True
+            ck = conv_key(a.get("conv_url", ""))
+            why = None
+            if any(a["qid"] in (v.get("answered") or []) for v in tabs):
+                why = "answered in Hark"
+            elif ck in running:
+                why = "Hark resumed work (Working badge)"
+            else:
+                for v in tabs:
+                    if conv_key(v.get("url", "")) != ck or not v.get("hasList"):
+                        continue
+                    if v.get("working"):
+                        why = "Hark resumed work in this chat"
+                    elif v.get("optional") and v.get("qid") == a["qid"]:
+                        why = "optional suggestion, not a question"
+                    elif v.get("lastId") and v.get("lastId") != a["qid"] and not (v.get("pending") and v.get("qid") == a["qid"]):
+                        why = "conversation moved on"
+                    if why:
+                        break
+            if why and self.alerts.resolve(a, why):
+                changed = True
         return changed
 
     def process_hark_state(self, p, h):
-        if not h.get("pending") or not h.get("qid"):
+        if h.get("working") or not h.get("pending") or not h.get("qid"):
             return
         if self.alerts.reopen_if_resolved(h["qid"]):
             self.changed.emit()  # a question still waiting was marked resolved too early: reopen it, no repeat alert

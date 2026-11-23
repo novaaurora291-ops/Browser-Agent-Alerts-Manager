@@ -37,37 +37,75 @@
     if (h && txt(h)) return txt(h).slice(0, 80);
     return "Project " + p.split("/")[2].slice(0, 8);
   }
+  // ---- live run state (what Hark itself shows) ----
+  const IDLE_PHASE = /^(done|idle|complete|completed|finished|stopped|error)$/i;
+  const OFFER = /^(want me to|would you like|would a |would an |shall i|should i also|do you want me to|if you('d| would) like|i can also)/i;
+  function projectId() { const m = location.pathname.match(/^\/project\/([0-9a-f-]{8,})/i); return m ? m[1] : ""; }
+  function convKey() { const id = projectId(); return id ? "project:" + id : (location.pathname.startsWith("/chat") || location.pathname === "/" ? "chat" : location.pathname); }
+  function runningProjects() {
+    const out = [];
+    document.querySelectorAll("[data-project-id]").forEach(el => {
+      if (/(^|\n)\s*(Working|Waiting for your task to finish)\s*($|\n)/i.test(txt(el))) out.push(el.getAttribute("data-project-id"));
+    });
+    return out;
+  }
+  function liveRun(list) {
+    const root = (list && list.closest("[data-testid=chat-column]")) || (list && list.parentElement && list.parentElement.parentElement) || document;
+    const reasons = [];
+    root.querySelectorAll("[data-testid=live-run-pill], [data-testid=run-narration]").forEach(el => {
+      const ph = el.getAttribute("data-phase") || "";
+      if (!IDLE_PHASE.test(ph)) reasons.push("pill:" + (ph || txt(el).slice(0, 40)));
+    });
+    // "Waiting for your task to finish" chip under the last message
+    const all = root.querySelectorAll("button, span, div");
+    for (let i = all.length - 1, n = 0; i >= 0 && n < 400; i--, n++) {
+      const el = all[i];
+      if (el.children.length > 2) continue;
+      const t = (el.textContent || "").trim();
+      if (t.length < 60 && /^waiting for your task to finish$/i.test(t)) { reasons.push("waiting-task"); break; }
+    }
+    const pid = projectId();
+    if (pid && runningProjects().includes(pid)) reasons.push("badge");
+    if (list && list.parentElement && list.parentElement.querySelector("[aria-busy=true], [data-typing], [data-testid*=typing], [data-testid*=thinking]")) reasons.push("typing");
+    return reasons;
+  }
   window.__harkDetect = function () {
     const list = document.querySelector("[data-testid=message-list]");
-    const base = { pending: false, working: false, convTitle: convTitle(), hasList: !!list };
+    const base = { pending: false, working: false, convTitle: convTitle(), convKey: convKey(), hasList: !!list, running: runningProjects() };
     if (!list) return base;
     const entries = Array.from(list.querySelectorAll("[data-entry-kind]")).filter(e => !e.parentElement.closest("[data-entry-kind]"));
-    if (!entries.length) return base;
-    const busy = !!list.parentElement.querySelector("[aria-busy=true], [data-typing], [data-testid*=typing], [data-testid*=thinking]");
+    const why = liveRun(list);
+    base.workWhy = why;
+    if (!entries.length) return Object.assign(base, { working: why.length > 0 });
     // assistant messages the user has already replied after (used to mark alerts Resolved)
     const answered = [];
     let seenUser = false;
-    for (let i = entries.length - 1; i >= 0 && answered.length < 8; i--) {
+    for (let i = entries.length - 1; i >= 0 && answered.length < 12; i--) {
       if (isUser(entries[i])) { seenUser = true; continue; }
       if (seenUser) { const id = entries[i].getAttribute("data-message-id"); if (id) answered.push(id); }
     }
     base.answered = answered;
     const last = entries[entries.length - 1];
-    if (isUser(last)) return Object.assign(base, { working: true, lastId: last.getAttribute("data-message-id") });
-    const trailing = [];
-    for (let i = entries.length - 1; i >= 0 && !isUser(entries[i]); i--) trailing.unshift(entries[i]);
-    for (let i = trailing.length - 1; i >= 0; i--) {
-      const e = trailing[i];
-      if (isBrief(e)) continue;
-      const t = txt(e.querySelector("[data-testid=message-text]") || e);
-      const hasForm = !!e.querySelector("input:not([type=hidden]), button[aria-label*=pprove i], form");
-      if (t.includes("?") || t.includes("\u061F") || hasForm) {
-        const paras = Array.from(e.querySelectorAll("p, li")).map(txt).filter(Boolean);
-        let q = paras.filter(x => x.includes("?") || x.includes("\u061F")).pop() || t;
-        return Object.assign(base, { pending: true, working: busy, qid: e.getAttribute("data-message-id") || e.getAttribute("data-entry-id") || ("h" + t.length + t.slice(0, 40)), question: q.slice(0, 600), full: t.slice(0, 1200) });
-      }
+    base.lastId = last.getAttribute("data-message-id") || "";
+    if (isUser(last)) return Object.assign(base, { working: true, workWhy: why.concat("user-last") });
+    if (why.length) return Object.assign(base, { working: true });
+    // Hark is idle: only its LAST real message (after the user's latest message) can be waiting on the user
+    let e = null;
+    for (let i = entries.length - 1; i >= 0 && !isUser(entries[i]); i--) {
+      if (isBrief(entries[i])) continue;
+      e = entries[i]; break;
     }
-    return Object.assign(base, { working: busy });
+    if (!e) return base;
+    const t = txt(e.querySelector("[data-testid=message-text]") || e);
+    const hasForm = !!e.querySelector("input:not([type=hidden]), textarea, button[aria-label*=pprove i], form");
+    const paras = Array.from(e.querySelectorAll("p, li")).map(txt).filter(Boolean);
+    const qs = paras.filter(x => x.includes("?") || x.includes("\u061F"));
+    if (!qs.length && !hasForm && !(t.includes("?") || t.includes("\u061F"))) return base;
+    let q = qs.pop() || t;
+    // the question sentence itself (last sentence ending in ?)
+    const sent = q.split(/(?<=[.!\u06D4])\s+/).filter(x => /[?\u061F]/.test(x)).pop() || q;
+    const optional = !hasForm && OFFER.test(sent.trim());
+    return Object.assign(base, { pending: !optional, optional, qid: e.getAttribute("data-message-id") || e.getAttribute("data-entry-id") || ("h" + t.length + t.slice(0, 40)), question: q.slice(0, 600), full: t.slice(0, 1200) });
   };
   let seenQ = "", seenAt = 0;
   function detect() {
@@ -118,7 +156,19 @@
         return { html: r.outerHTML.replace(/<path[^>]*>/g, "").slice(0, 2500), rect: rr ? [rr.left, rr.right, rr.width] : null, listW: document.querySelector("[data-testid=message-list]").getBoundingClientRect().width };
       });
       const tail = document.querySelector("[data-testid=message-list]");
-      send({ url: location.href, ids, rows, tailHtml: tail ? tail.outerHTML.slice(-3000) : "", text: document.body.innerText.slice(-3000), list: ml ? compact(ml, 0) : null,
+      const marks = [];
+      document.querySelectorAll("body *").forEach(e => {
+        if (e.children.length) return;
+        const t = (e.textContent || "").trim();
+        if (t && t.length < 60 && /working|waiting|thinking|paused|needs|reply|running/i.test(t)) {
+          let a = e; for (let i = 0; i < 4 && a.parentElement; i++) a = a.parentElement;
+          marks.push({ t, html: a.outerHTML.replace(/<path[^>]*>/g, "").replace(/<svg.*?<\/svg>/gs, "").slice(0, 1500) });
+        }
+      });
+      const side = document.querySelector("[data-testid=projects-panel]");
+      const col = document.querySelector("[data-testid=chat-column]") || (ml && ml.parentElement && ml.parentElement.parentElement);
+      send({ url: location.href, ids, rows, marks: marks.slice(0, 40), side: side ? side.outerHTML.replace(/<path[^>]*>/g, "").replace(/<svg.*?<\/svg>/gs, "").slice(0, 8000) : null,
+             colTail: col ? Array.from(col.children).slice(-3).map(c => c.outerHTML.replace(/<path[^>]*>/g, "").replace(/<svg.*?<\/svg>/gs, "").slice(-3000)) : null, tailHtml: tail ? tail.outerHTML.slice(-3000) : "", text: document.body.innerText.slice(-3000), list: ml ? compact(ml, 0) : null,
              composer: Array.from(document.querySelectorAll("textarea, [contenteditable], [role=textbox]")).map(e => compact(e, 12)),
              buttons: Array.from(document.querySelectorAll("button")).map(b => b.getAttribute("aria-label") || b.textContent.trim().slice(0,30)) });
       return;
