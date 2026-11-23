@@ -43,7 +43,7 @@ class AlertStore:
             "id": uuid.uuid4().hex[:12], "qid": qid, "profile_dir": profile_dir, "profile_name": profile_name,
             "email": email, "question": question, "conv_url": conv_url, "conv_title": conv_title,
             "received": time.time(), "status": "needs_reply", "resolved_at": None,
-            "telegram": None, "desktop": False,
+            "telegram": None, "desktop": False, "v": 2,
         }
         self.alerts.append(a)
         self.save()

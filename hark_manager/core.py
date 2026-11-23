@@ -1,7 +1,8 @@
 """Controller: profiles + live state from the bridge, alert lifecycle, notifications, previews."""
 import threading
 import time
-EXT_VERSION = "1.0.4"
+EXT_VERSION = "1.0.5"
+ALERT_GRACE = 15  # an alert Hark no longer shows as waiting (live DOM) is cleared after this many seconds
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -43,6 +44,11 @@ class Controller(QObject):
         self.tg_ok = False
         self.tg_msg = "Telegram not set up"
         self._capturing = False
+        self.seen = {}        # alert qid -> last time a live Hark tab showed it still waiting
+        # alerts made by the older detector (scanned old messages for "?") are not trustworthy: clear them once
+        for a in self.alerts.open_alerts():
+            if a.get("v") != 2:
+                self.alerts.resolve(a, "made by older detector, re-checked live")
         self.reload_profiles()
 
         self.t_bridge = QTimer(self, timeout=self.drain_bridge, interval=400)
@@ -77,23 +83,19 @@ class Controller(QObject):
             return []
         return list(st["hark"].values())
 
-    def status(self, p):
+    def is_working(self, p):
         tabs = self.live_tabs(p)
-        open_ = [a for a in self.alerts.open_alerts() if a["profile_dir"] == p.directory]
-        # what Hark itself shows wins: a running task (Working badge / live pill / "Waiting for your task
-        # to finish") means Working, unless another conversation genuinely waits on the user
-        working_convs = {conv_key(h.get("url", "")) for h in tabs if h.get("working")}
-        for h in tabs:
-            working_convs.update("project:" + r for r in (h.get("running") or []))
-        waiting = [a for a in open_ if conv_key(a.get("conv_url", "")) not in working_convs]
-        if working_convs and not waiting:
+        return any(h.get("working") or h.get("running") for h in tabs)
+
+    def status(self, p):
+        # RUNNING wins: if Hark shows a running task in this profile (live pill, Stop button, Working badge,
+        # "Waiting for your task to finish", or the user's message is last) the profile is Working.
+        if self.is_working(p):
             return "Working"
-        if waiting:
+        if any(a["profile_dir"] == p.directory for a in self.alerts.open_alerts()):
             return "Needs reply"
         if not self.windows.get(p.directory):
             return "Closed"
-        if working_convs:
-            return "Working"
         return "Idle"
 
     def bridge_live(self, p):
@@ -170,6 +172,8 @@ class Controller(QObject):
             st["reload_asked"] = time.time()
             self.bridge.queue_command(email, {"type": "reload_ext"})
             log(f"bridge in {p.directory} is {rep.get('ver')}, asked to reload to {EXT_VERSION}")
+        if time.time() - st["t"] >= STALE:
+            st["live_since"] = time.time()  # bridge (re)connected: give alerts a fresh grace window
         st["t"] = rep["_t"]
         st["tabs"] = rep.get("tabs", [])
         live_tabs = {t["id"] for t in st["tabs"]}
@@ -180,8 +184,9 @@ class Controller(QObject):
             prev = st["hark"].get(h["tabId"])
             st["hark"][h["tabId"]] = h
             changed = prev != h
-            sig = (h.get("working"), h.get("pending"), h.get("optional"), h.get("qid"))
-            if not prev or sig != (prev.get("working"), prev.get("pending"), prev.get("optional"), prev.get("qid")):
+            kinds = lambda x: tuple(sorted({str(r).split(":")[0] for r in (x.get("workWhy") or [])}))
+            sig = (h.get("working"), h.get("pending"), h.get("optional"), h.get("qid"), kinds(h))
+            if not prev or sig != (prev.get("working"), prev.get("pending"), prev.get("optional"), prev.get("qid"), kinds(prev)):
                 log(f"state {p.name} {conv_key(h.get('url',''))} working={h.get('working')} why={h.get('workWhy')} "
                     f"pending={h.get('pending')} optional={h.get('optional')} q={(h.get('question') or '')[:60]!r}")
             self.process_hark_state(p, h)
@@ -213,11 +218,24 @@ class Controller(QObject):
                         break
             if why and self.alerts.resolve(a, why):
                 changed = True
+        # live check: an alert stays only while a Hark tab of this profile still shows THAT question waiting
+        now = time.time()
+        for v in tabs:
+            if v.get("qid") and (v.get("pending") or v.get("settling")) and not v.get("working"):
+                self.seen[v["qid"]] = now
+        for a in self.alerts.open_alerts():
+            if a["profile_dir"] != p.directory:
+                continue
+            last = self.seen.setdefault(a["qid"], a.get("received", now))
+            if now - max(last, st.get("live_since", now)) > ALERT_GRACE:
+                if self.alerts.resolve(a, "no longer waiting in Hark (live check)"):
+                    changed = True
         return changed
 
     def process_hark_state(self, p, h):
         if h.get("working") or not h.get("pending") or not h.get("qid"):
             return
+        self.seen[h["qid"]] = time.time()
         if self.alerts.reopen_if_resolved(h["qid"]):
             self.changed.emit()  # a question still waiting was marked resolved too early: reopen it, no repeat alert
             return

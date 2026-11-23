@@ -49,32 +49,38 @@
     });
     return out;
   }
-  function liveRun(list) {
-    const root = (list && list.closest("[data-testid=chat-column]")) || (list && list.parentElement && list.parentElement.parentElement) || document;
-    const reasons = [];
-    root.querySelectorAll("[data-testid=live-run-pill], [data-testid=run-narration]").forEach(el => {
-      const ph = el.getAttribute("data-phase") || "";
-      if (!IDLE_PHASE.test(ph)) reasons.push("pill:" + (ph || txt(el).slice(0, 40)));
-    });
-    // "Waiting for your task to finish" chip under the last message
-    const all = root.querySelectorAll("button, span, div");
-    for (let i = all.length - 1, n = 0; i >= 0 && n < 400; i--, n++) {
-      const el = all[i];
-      if (el.children.length > 2) continue;
-      const t = (el.textContent || "").trim();
-      if (t.length < 60 && /^waiting for your task to finish$/i.test(t)) { reasons.push("waiting-task"); break; }
+  function shown(el) {
+    if (!el || !el.isConnected) return false;
+    for (let a = el, i = 0; a && i < 6; a = a.parentElement, i++) {
+      const cs = getComputedStyle(a);
+      if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0) return false;
     }
+    return true;
+  }
+  // what Hark itself shows RIGHT NOW for a running task (whole page, not old messages)
+  function liveRun() {
+    const reasons = [];
+    document.querySelectorAll("[data-testid=live-run-pill], [data-testid=run-narration]").forEach(el => {
+      const ph = el.getAttribute("data-phase") || (el.querySelector("[data-phase]") || el).getAttribute("data-phase") || "";
+      if (IDLE_PHASE.test(ph) || !shown(el)) return;
+      reasons.push("pill:" + (ph || "run") + ":" + txt(el).slice(0, 40));
+    });
+    // "Waiting for your task to finish" chip
+    const w = document.evaluate("//*[normalize-space(text())='Waiting for your task to finish']", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+    if (w && shown(w)) reasons.push("waiting-task");
+    // composer Stop button only exists while a run is going
+    const stop = Array.from(document.querySelectorAll("button[aria-label]")).find(b => /^stop( generating| run| task)?$/i.test(b.getAttribute("aria-label")) && shown(b));
+    if (stop) reasons.push("stop-button");
     const pid = projectId();
     if (pid && runningProjects().includes(pid)) reasons.push("badge");
-    if (list && list.parentElement && list.parentElement.querySelector("[aria-busy=true], [data-typing], [data-testid*=typing], [data-testid*=thinking]")) reasons.push("typing");
-    return reasons;
+    return Array.from(new Set(reasons));
   }
   window.__harkDetect = function () {
     const list = document.querySelector("[data-testid=message-list]");
     const base = { pending: false, working: false, convTitle: convTitle(), convKey: convKey(), hasList: !!list, running: runningProjects() };
     if (!list) return base;
     const entries = Array.from(list.querySelectorAll("[data-entry-kind]")).filter(e => !e.parentElement.closest("[data-entry-kind]"));
-    const why = liveRun(list);
+    const why = liveRun();
     base.workWhy = why;
     if (!entries.length) return Object.assign(base, { working: why.length > 0 });
     // assistant messages the user has already replied after (used to mark alerts Resolved)
@@ -112,7 +118,7 @@
     const st = window.__harkDetect ? window.__harkDetect() : { pending: false };
     if (st.pending) {
       if (st.qid !== seenQ) { seenQ = st.qid; seenAt = Date.now(); }
-      if (Date.now() - seenAt < 3000) { st.pending = false; st.settling = true; }
+      if (Date.now() - seenAt < 6000) { st.pending = false; st.settling = true; }
     } else { seenQ = ""; }
     try {
       const l = document.querySelector("[data-testid=message-list]");
@@ -179,7 +185,12 @@
     }
   });
   setInterval(() => tick(false), 2000);
-  new MutationObserver(() => { clearTimeout(window.__hbmT); window.__hbmT = setTimeout(() => tick(false), 400); })
+  let lastMut = 0;
+  new MutationObserver(() => {
+    const now = Date.now();
+    if (now - lastMut > 700) { lastMut = now; tick(false); }  // run inline: timers are throttled in background tabs
+    clearTimeout(window.__hbmT); window.__hbmT = setTimeout(() => tick(false), 800);
+  })
     .observe(document.documentElement, { subtree: true, childList: true, characterData: true });
   tick(true);
 })();
