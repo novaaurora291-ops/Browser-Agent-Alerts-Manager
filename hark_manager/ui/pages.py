@@ -145,6 +145,46 @@ class ProfileRow(QFrame):
         self.prev.set_png(c.previews.get(self.p.directory) if open_ and c.settings["show_previews"] else None, "" if open_ else "")
 
 
+def short_browser(name):
+    return "Chrome" if name == "Google Chrome" else name
+
+
+class ClosedRow(QFrame):
+    """One row of the Closed tab: Profile, Browser, Launch (opens the profile with its saved browser + data folder)."""
+
+    def __init__(self, page, p, last=False):
+        super().__init__()
+        self.page, self.p = page, p
+        self.setObjectName("closedRow")
+        self.setStyleSheet("QFrame#closedRow{background:white;border:none;" + ("" if last else "border-bottom:1px solid #E3E6EA;") + "}")
+        h = QHBoxLayout(self)
+        h.setContentsMargins(26, 10, 26, 10)
+        h.setSpacing(14)
+        av = QLabel()
+        av.setPixmap(icons.pixmap("user", 22, "#5B616B"))
+        av.setFixedSize(38, 38)
+        av.setAlignment(Qt.AlignCenter)
+        av.setStyleSheet("background:#EEF0F2;border-radius:19px;")
+        h.addWidget(av)
+        self.name = label(p.name, size=18, bold=True)
+        self.name.setToolTip(p.email or "")
+        h.addWidget(self.name, 4)
+        h.addWidget(label(short_browser(p.browser_name), size=17), 3)
+        self.action = button("Launch", "primary", "play", 16)
+        self.action.setMinimumSize(166, 40)
+        self.action.setStyleSheet("font-size:17px;")
+        self.action.clicked.connect(self.launch)
+        h.addWidget(self.action, 2, Qt.AlignLeft)
+
+    def launch(self):
+        self.action.setEnabled(False)
+        self.action.setText("Opening…")
+        self.page.ctl.launch(self.p)
+
+    def refresh(self):
+        self.name.setText(self.p.name)
+
+
 class ProfilesPage(QWidget):
     install_bridge = Signal(str)
 
@@ -156,6 +196,26 @@ class ProfilesPage(QWidget):
         v.setContentsMargins(24, 22, 24, 10)
         v.setSpacing(18)
         v.addWidget(label("Browser profiles", obj="h1"))
+        tabs = QHBoxLayout()
+        tabs.setSpacing(0)
+        self.t_open = QPushButton("Open")
+        self.t_closed = QPushButton("Closed")
+        tg = QButtonGroup(self)
+        for b in (self.t_open, self.t_closed):
+            b.setObjectName("seg")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setMinimumSize(126, 40)
+            tg.addButton(b)
+            tabs.addWidget(b)
+        self.t_open.setStyleSheet("font-size:17px;border-top-left-radius:9px;border-bottom-left-radius:9px;")
+        self.t_closed.setStyleSheet("font-size:17px;border-top-right-radius:9px;border-bottom-right-radius:9px;")
+        self.tab = "open"
+        self.t_open.setChecked(True)
+        self.t_open.clicked.connect(lambda: self.set_tab("open"))
+        self.t_closed.clicked.connect(lambda: self.set_tab("closed"))
+        tabs.addStretch(1)
+        v.addLayout(tabs)
         self.bar = QGridLayout()
         self.bar.setHorizontalSpacing(18)
         self.bar.setVerticalSpacing(12)
@@ -212,6 +272,17 @@ class ProfilesPage(QWidget):
         ctl.previews_changed.connect(self.refresh)
         self.rebuild()
 
+    def set_tab(self, t):
+        self.tab = t
+        (self.t_open if t == "open" else self.t_closed).setChecked(True)
+        self.filter.setVisible(t == "open")
+        self.seg.setVisible(t == "open")
+        self.rebuild()
+
+    def is_open(self, p):
+        # any window of the profile counts, minimized ones too
+        return bool(self.ctl.windows.get(p.directory))
+
     def set_mode(self, m):
         self.ctl.settings["view_mode"] = m
         self.ctl.settings.save()
@@ -228,12 +299,23 @@ class ProfilesPage(QWidget):
                 continue
             if q and q not in (p.name + " " + p.email + " " + p.chrome_name + " " + p.gaia).lower():
                 continue
-            if f != "All statuses" and self.ctl.status(p) != f:
+            if (self.tab == "open") != self.is_open(p):
+                continue
+            if self.tab == "open" and f != "All statuses" and self.ctl.status(p) != f:
                 continue
             out.append(p)
         # profiles needing a reply / open first, like the mock-up
+        if self.tab == "closed":
+            return sorted(out, key=lambda p: (p.managed, p.name.lower()))
         rank = {"Needs reply": 0, "Working": 1, "Idle": 2, "Closed": 3}
         return sorted(out, key=lambda p: rank.get(self.ctl.status(p), 9))
+
+    def update_counts(self):
+        hid = set(self.ctl.settings["hidden_profiles"] or [])
+        ps = [p for p in self.ctl.profiles if p.directory not in hid]
+        n = sum(1 for p in ps if self.is_open(p))
+        self.t_open.setText(f"Open ({n})")
+        self.t_closed.setText(f"Closed ({len(ps) - n})")
 
     def rebuild(self):
         while self.grid.count():
@@ -244,7 +326,10 @@ class ProfilesPage(QWidget):
         self.items = {}
         mode = self.ctl.settings["view_mode"]
         ps = self.visible_profiles()
-        self._sig = [p.directory for p in ps]
+        self._sig = (self.tab, [p.directory for p in ps])
+        self.update_counts()
+        if self.tab == "closed":
+            return self._build_closed(ps)
         for i, p in enumerate(ps):
             if mode == "list":
                 w = ProfileRow(self, p)
@@ -255,16 +340,50 @@ class ProfilesPage(QWidget):
             self.items[p.directory] = w
             w.refresh()
         if not ps:
-            self.grid.addWidget(label("Koi profile nahi mila.", obj="muted"), 0, 0)
+            self.grid.addWidget(label("Koi profile khula nahi. Closed tab se Launch karein." if self.tab == "open" and not self.search.text().strip() else "Koi profile nahi mila.", obj="muted"), 0, 0)
         ncols = self.cols if mode == "grid" else 1
         for c in range(8):
             # only real columns stretch (equal widths); empty columns must not eat space
             self.grid.setColumnStretch(c, 1 if c < ncols else 0)
         self.grid.setRowStretch(self.grid.rowCount(), 1)
 
+    def _build_closed(self, ps):
+        for c in range(8):
+            self.grid.setColumnStretch(c, 1 if c == 0 else 0)
+        tbl = QFrame()
+        tbl.setObjectName("closedTbl")
+        tbl.setStyleSheet("QFrame#closedTbl{background:white;border:1px solid #E3E6EA;border-radius:14px;}")
+        tv = QVBoxLayout(tbl)
+        tv.setContentsMargins(1, 1, 1, 1)
+        tv.setSpacing(0)
+        head = QFrame()
+        head.setObjectName("closedHead")
+        head.setStyleSheet("QFrame#closedHead{background:#F3F4F5;border:none;border-bottom:1px solid #E3E6EA;border-top-left-radius:13px;border-top-right-radius:13px;}")
+        hh = QHBoxLayout(head)
+        hh.setContentsMargins(26, 12, 26, 12)
+        hh.setSpacing(14)
+        sp = QLabel()
+        sp.setFixedWidth(38)
+        hh.addWidget(label("Profile", size=17, bold=True), 4)
+        hh.addWidget(label("Browser", size=17, bold=True), 3)
+        hh.addWidget(label("Action", size=17, bold=True), 2)
+        hh.insertSpacing(0, 0)
+        tv.addWidget(head)
+        for i, p in enumerate(ps):
+            r = ClosedRow(self, p, last=(i == len(ps) - 1))
+            tv.addWidget(r)
+            self.items[p.directory] = r
+        if not ps:
+            e = label("Koi band profile nahi mila." if self.search.text().strip() else "Sab profiles khule hain.", obj="muted")
+            e.setContentsMargins(26, 16, 26, 16)
+            tv.addWidget(e)
+        self.grid.addWidget(tbl, 0, 0)
+        self.grid.setRowStretch(self.grid.rowCount(), 1)
+
     def refresh(self):
-        if [p.directory for p in self.visible_profiles()] != getattr(self, "_sig", None):
+        if (self.tab, [p.directory for p in self.visible_profiles()]) != getattr(self, "_sig", None):
             return self.rebuild()
+        self.update_counts()
         for w in self.items.values():
             w.refresh()
 
@@ -321,21 +440,9 @@ class ProfilesPage(QWidget):
         self._update_cols()
 
     def add_profile(self):
-        exe = self.ctl.browser_exe()
-        bname = chrome_mod.browser_name(exe) if exe else "Google Chrome"
-        name, ok = QInputDialog.getText(self, "Add profile", f"Naye {bname} profile ka naam:")
-        if not ok:
-            return
-        try:
-            r = self.ctl.add_profile(name.strip())
-        except Exception as e:
-            QMessageBox.warning(self, "Add profile", f"Profile nahi ban saka: {e}")
-            return
-        if r["kind"] == "managed":
-            self.rebuild()
-            QMessageBox.information(self, "Add profile", f"{r['browser']} mein naya profile \"{r['name']}\" ban gaya aur khul raha hai.\n\nData folder:\n{r['dir']}")
-        else:
-            QMessageBox.information(self, "Add profile", f"Chrome mein naya profile ({r['dir']}) khul raha hai. Wahan Google/Hark mein sign in kar lein; ye list mein khud aa jayega.")
+        from .add_profile import AddProfileDialog
+        AddProfileDialog(self).exec()
+        self.rebuild()
 
 
 # ======================= Alerts =======================

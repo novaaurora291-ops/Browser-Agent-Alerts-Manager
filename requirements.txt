@@ -6,3 +6,4 @@ pywinauto
 pillow
 requests
 pyperclip
+websocket-client

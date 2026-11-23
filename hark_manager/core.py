@@ -73,7 +73,7 @@ class Controller(QObject):
         for m in self.settings["managed_profiles"] or []:
             p = chrome.Profile("hbm:" + m["id"], m.get("name") or m["id"])
             p.kind, p.tag, p.data_dir, p.exe = "managed", m["id"], m["data_dir"], m.get("exe", "")
-            p.email = chrome.managed_email(p.data_dir)
+            p.email = chrome.managed_email(p.data_dir) or m.get("email", "")
             p.alias = aliases.get(p.directory, "")
             managed.append(p)
         self.profiles = ps + managed
@@ -95,12 +95,12 @@ class Controller(QObject):
             return p.exe
         return self.browser_exe() or chrome.chrome_exe()
 
-    def open_in(self, p, url=None, new_window=False):
+    def open_in(self, p, url=None, new_window=False, extra=None):
         if p.managed:
             m = self._managed_rec(p.tag) or {}
             if not m.get("tagged") and not url:
                 url = "https://hark.com/"
-            chrome.launch_managed(p, self.exe_for(p), url, new_window, config.ensure_profile_extension(p.data_dir, p.tag))
+            chrome.launch_managed(p, self.exe_for(p), url, new_window, config.ensure_profile_extension(p.data_dir, p.tag), extra)
         else:
             chrome.launch(p.directory, url, new_window)
 
@@ -393,7 +393,15 @@ class Controller(QObject):
             QTimer.singleShot(2500, lambda p=p: chrome.focus_profile(p, prefer_title="Hark"))
         log(f"open_task {a['qid']} -> {p.directory} {url}")
 
-    def add_profile(self, name):
+    def set_managed_field(self, tag, key, value):
+        recs = list(self.settings["managed_profiles"] or [])
+        for m in recs:
+            if m["id"] == tag:
+                m[key] = value
+        self.settings["managed_profiles"] = recs
+        self.settings.save()
+
+    def add_profile(self, name, launch=True):
         """With a browser set in Settings: a new profile with its own user-data-dir in <tool>\\BrowserProfiles.
         Without one: the old way, a new profile inside Google Chrome."""
         exe = self.browser_exe()
@@ -424,9 +432,10 @@ class Controller(QObject):
         self.settings.save()
         log(f"managed profile created {pid} '{name}' -> {data_dir}")
         self.reload_profiles()
-        self.open_in(self.profile("hbm:" + pid))
-        QTimer.singleShot(2500, self.refresh_windows)
-        return {"kind": "managed", "dir": data_dir, "browser": chrome.browser_name(exe), "name": name}
+        if launch:
+            self.open_in(self.profile("hbm:" + pid))
+            QTimer.singleShot(2500, self.refresh_windows)
+        return {"kind": "managed", "tag": pid, "dir": data_dir, "browser": chrome.browser_name(exe), "name": name}
 
     def rename(self, p, name):
         al = dict(self.settings["aliases"] or {})

@@ -125,9 +125,9 @@ def norm_dir(d):
     return os.path.normcase(os.path.abspath(d)).rstrip("\\/") if d else ""
 
 
-def launch_managed(p, exe, url=None, new_window=False, ext_dir=None):
+def launch_managed(p, exe, url=None, new_window=False, ext_dir=None, extra=None):
     os.makedirs(p.data_dir, exist_ok=True)
-    args = [exe, f"--user-data-dir={p.data_dir}", "--no-first-run", "--no-default-browser-check"]
+    args = [exe, f"--user-data-dir={p.data_dir}", "--no-first-run", "--no-default-browser-check"] + list(extra or [])
     if ext_dir and os.path.isdir(ext_dir):
         args.append(f"--load-extension={ext_dir}")
     if new_window:
