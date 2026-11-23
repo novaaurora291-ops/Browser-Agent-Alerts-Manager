@@ -118,7 +118,7 @@ class MainWindow(QMainWindow):
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(0)
 
-        side = QWidget()
+        side = self.side = QWidget()
         side.setObjectName("sidebar")
         side.setAttribute(Qt.WA_StyledBackground, True)
         side.setFixedWidth(228)
@@ -140,13 +140,19 @@ class MainWindow(QMainWindow):
         self.profiles = ProfilesPage(ctl)
         self.alerts = AlertsPage(ctl)
         self.settings = SettingsPage(ctl)
-        for p in (self.profiles, self.alerts, self.settings):
+        from .browser_view import BrowserView
+        self.view = BrowserView(ctl)
+        for p in (self.profiles, self.alerts, self.settings, self.view):
             self.stack.addWidget(p)
         h.addWidget(self.stack, 1)
         self.right = NeedsReplyPanel(ctl)
         h.addWidget(self.right)
 
         self.profiles.install_bridge.connect(self.install_bridge)
+        self.profiles.open_view.connect(lambda d: ctl.view_profile(ctl.profile(d)) if ctl.profile(d) else None)
+        ctl.view_request.connect(self.show_view)
+        self.view.back.connect(lambda: self.go(0))
+        self.view.expand_toggled.connect(self.set_expanded)
         ctl.changed.connect(self.update_badge)
         ctl.new_alert.connect(self.on_new_alert)
         ctl.need_telegram_setup.connect(self.open_secure_input)
@@ -172,11 +178,28 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(800, lambda: QMessageBox.warning(self, APP_TITLE, f"Bridge port {config.BRIDGE_PORT} busy hai: {ctl.bridge.error}\nKya app pehle se chal rahi hai?"))
 
     def go(self, i):
+        if self.stack.currentIndex() == 3 and i != 3:
+            # leaving the live view (Back or a nav click): hand the browser window back to the desktop
+            if self.view.expanded:
+                self.view.toggle_expand()
+            self.view.release()
+            self.view.dir = None
         for j, b in enumerate(self.navs):
-            b.setChecked(i == j)
+            b.setChecked(i == j or (i == 3 and j == 0))
         self.stack.setCurrentIndex(i)
-        self.ctl.settings["last_view"] = i
-        self.ctl.settings.save()
+        if i != 3:
+            self.ctl.settings["last_view"] = i
+            self.ctl.settings.save()
+
+    def show_view(self, directory, prefer=""):
+        if not self.isVisible() or self.isMinimized():
+            self.show_normal()
+        self.go(3)
+        self.view.show_profile(directory, prefer)
+
+    def set_expanded(self, on):
+        self.side.setVisible(not on)
+        self.right.setVisible(not on)
 
     def update_badge(self):
         n = self.ctl.needs_reply_count()
@@ -229,10 +252,14 @@ class MainWindow(QMainWindow):
     def changeEvent(self, e):
         from PySide6.QtCore import QEvent
         if e.type() == QEvent.WindowStateChange and self.isMinimized() and self.ctl.settings["minimize_to_tray"]:
+            if self.stack.currentIndex() == 3:
+                self.go(0)
             QTimer.singleShot(0, self.hide)
         super().changeEvent(e)
 
     def closeEvent(self, e):
+        if self.stack.currentIndex() == 3:
+            self.go(0)  # never let a hosted browser window close with the Manager
         if not self.quitting and self.ctl.settings["minimize_to_tray"]:
             e.ignore()
             self.hide()

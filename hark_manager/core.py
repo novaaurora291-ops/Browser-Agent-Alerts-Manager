@@ -30,6 +30,7 @@ class Controller(QObject):
     new_alert = Signal(dict)           # fresh alert -> desktop notification
     telegram_status = Signal(bool, str)
     need_telegram_setup = Signal(str)
+    view_request = Signal(str, str)    # profile_dir, preferred window title -> show it inside the Manager
 
     def __init__(self):
         super().__init__()
@@ -42,6 +43,7 @@ class Controller(QObject):
         self.by_tag = {}
         self.state = {}       # profile_dir -> {"t":..., "tabs":[...], "hark":{tabId: state}}
         self.windows = {}     # profile_dir -> [(hwnd,title,aumid,minimized)]
+        self.embedded = {}    # profile_dir -> hwnd of its browser window currently hosted inside the Manager
         self.previews = {}    # profile_dir -> png bytes
         self.tg_ok = False
         self.tg_msg = "Telegram not set up"
@@ -153,6 +155,13 @@ class Controller(QObject):
             log(f"managed windows: {e}")
             mwins = {}
         new = {p.directory: chrome.windows_for(p, wins, mwins) for p in self.profiles}
+        # a window hosted inside the Manager is a child window now, so EnumWindows no longer lists it
+        for d, h in list(self.embedded.items()):
+            if chrome.is_window(h):
+                if d in new and not any(w[0] == h for w in new[d]):
+                    new[d] = [(h, chrome.window_title(h), "", False)] + new[d]
+            else:
+                self.embedded.pop(d, None)
         sig = lambda d: {k: [w[0] for w in v] for k, v in d.items()}
         if sig(new) != sig(self.windows):
             self.windows = new
@@ -369,6 +378,9 @@ class Controller(QObject):
 
     # ---------- actions ----------
     def focus_profile(self, p):
+        if p.directory in self.embedded:
+            self.view_request.emit(p.directory, "")
+            return True
         if chrome.focus_profile(p):
             return True
         self.open_in(p)
@@ -378,19 +390,26 @@ class Controller(QObject):
         self.open_in(p, new_window=bool(self.windows.get(p.directory)))
         QTimer.singleShot(1500, self.refresh_windows)
 
+    def view_profile(self, p, url=None):
+        """Show the profile's own browser window inside the Manager (launching it first when it is closed)."""
+        if not self.windows.get(p.directory) and p.directory not in self.embedded:
+            self.open_in(p, url or "https://hark.com/chat")
+            QTimer.singleShot(1500, self.refresh_windows)
+        self.view_request.emit(p.directory, "Hark")
+
     def open_task(self, a):
         p = self.profile(a["profile_dir"])
         if not p:
             return
         url = a["conv_url"] or "https://hark.com/chat"
-        if self.bridge_live(p):
+        open_ = bool(self.windows.get(p.directory)) or p.directory in self.embedded
+        if open_ and self.bridge_live(p):
+            # the extension finds the tab of that exact chat (or opens it) and activates it
             self.bridge.queue_command(self.bridge_key(p), {"type": "open_task", "url": url})
-            # the extension activates the tab on its next report; bring the window up as well
-            for delay in (600, 2500, 5000):
-                QTimer.singleShot(delay, lambda p=p: chrome.focus_profile(p, prefer_title="Hark"))
         else:
             self.open_in(p, url)
-            QTimer.singleShot(2500, lambda p=p: chrome.focus_profile(p, prefer_title="Hark"))
+            QTimer.singleShot(1500, self.refresh_windows)
+        self.view_request.emit(p.directory, "Hark")
         log(f"open_task {a['qid']} -> {p.directory} {url}")
 
     def set_managed_field(self, tag, key, value):

@@ -76,6 +76,13 @@ class ProfileCard(QFrame):
         ph = "Closed" if not open_ else ("Minimized" if mini else ("Previews off" if not show else "Loading preview…"))
         self.preview.set_png(c.previews.get(self.p.directory) if (open_ and show) else None, ph)
 
+    def mouseDoubleClickEvent(self, e):
+        # double-click: the profile's live Hark chat inside the Manager
+        if e.button() == Qt.LeftButton:
+            self.page.open_view.emit(self.p.directory)
+            return
+        QFrame.mouseDoubleClickEvent(self, e)
+
     def act(self):
         c = self.page.ctl
         if c.windows.get(self.p.directory):
@@ -87,6 +94,7 @@ class ProfileCard(QFrame):
         c = self.page.ctl
         m = QMenu(self)
         m.addAction("Launch new window", lambda: c.launch(self.p))
+        m.addAction("Open in Manager", lambda: self.page.open_view.emit(self.p.directory))
         m.addAction("Focus window", lambda: c.focus_profile(self.p))
         m.addAction("Open Hark", lambda: c.open_in(self.p, "https://hark.com/chat"))
         m.addSeparator()
@@ -134,6 +142,8 @@ class ProfileRow(QFrame):
         self.action.clicked.connect(lambda: ProfileCard.act(self))
         h.addWidget(self.action)
 
+    mouseDoubleClickEvent = ProfileCard.mouseDoubleClickEvent
+
     def refresh(self):
         c = self.page.ctl
         s = c.status(self.p)
@@ -176,6 +186,8 @@ class ClosedRow(QFrame):
         self.action.clicked.connect(self.launch)
         h.addWidget(self.action, 2, Qt.AlignLeft)
 
+    mouseDoubleClickEvent = ProfileCard.mouseDoubleClickEvent
+
     def launch(self):
         self.action.setEnabled(False)
         self.action.setText("Opening…")
@@ -187,6 +199,7 @@ class ClosedRow(QFrame):
 
 class ProfilesPage(QWidget):
     install_bridge = Signal(str)
+    open_view = Signal(str)   # profile dir -> show its live browser window inside the Manager
 
     def __init__(self, ctl):
         super().__init__()
@@ -222,6 +235,11 @@ class ProfilesPage(QWidget):
         self.search = SearchBox("Search profiles")
         self.search.textChanged.connect(self.rebuild)
         self.search.setMinimumWidth(160)
+        self.bfilter = QComboBox()
+        self.bfilter.addItem("All browsers")
+        self.bfilter.setMinimumHeight(42)
+        self.bfilter.setMinimumWidth(170)
+        self.bfilter.currentIndexChanged.connect(self.rebuild)
         self.filter = QComboBox()
         self.filter.addItems(["All statuses", "Working", "Needs reply", "Idle", "Closed"])
         self.filter.setMinimumHeight(42)
@@ -289,13 +307,37 @@ class ProfilesPage(QWidget):
         self.cols = self._calc_cols()
         self.rebuild()
 
+    def browser_options(self):
+        """Browsers that are saved: the one in Settings plus every browser a profile was made with."""
+        names = {"Chrome"}
+        exe = self.ctl.browser_exe()
+        if exe:
+            names.add(short_browser(chrome_mod.browser_name(exe)))
+        for p in self.ctl.profiles:
+            names.add(short_browser(p.browser_name))
+        return ["Chrome"] + sorted(n for n in names if n != "Chrome")
+
+    def update_browser_filter(self):
+        opts = ["All browsers"] + self.browser_options()
+        if [self.bfilter.itemText(i) for i in range(self.bfilter.count())] == opts:
+            return
+        cur = self.bfilter.currentText()
+        self.bfilter.blockSignals(True)
+        self.bfilter.clear()
+        self.bfilter.addItems(opts)
+        self.bfilter.setCurrentIndex(max(0, opts.index(cur) if cur in opts else 0))
+        self.bfilter.blockSignals(False)
+
     def visible_profiles(self):
         q = self.search.text().strip().lower()
         f = self.filter.currentText()
+        bf = self.bfilter.currentText()
         hid = set(self.ctl.settings["hidden_profiles"] or [])
         out = []
         for p in self.ctl.profiles:
             if p.directory in hid:
+                continue
+            if bf != "All browsers" and short_browser(p.browser_name) != bf:
                 continue
             if q and q not in (p.name + " " + p.email + " " + p.chrome_name + " " + p.gaia).lower():
                 continue
@@ -312,7 +354,8 @@ class ProfilesPage(QWidget):
 
     def update_counts(self):
         hid = set(self.ctl.settings["hidden_profiles"] or [])
-        ps = [p for p in self.ctl.profiles if p.directory not in hid]
+        bf = self.bfilter.currentText()
+        ps = [p for p in self.ctl.profiles if p.directory not in hid and (bf == "All browsers" or short_browser(p.browser_name) == bf)]
         n = sum(1 for p in ps if self.is_open(p))
         self.t_open.setText(f"Open ({n})")
         self.t_closed.setText(f"Closed ({len(ps) - n})")
@@ -325,6 +368,7 @@ class ProfilesPage(QWidget):
                 w.deleteLater()
         self.items = {}
         mode = self.ctl.settings["view_mode"]
+        self.update_browser_filter()
         ps = self.visible_profiles()
         self._sig = (self.tab, [p.directory for p in ps])
         self.update_counts()
@@ -367,7 +411,7 @@ class ProfilesPage(QWidget):
         hh.addWidget(label("Profile", size=17, bold=True), 4)
         hh.addWidget(label("Browser", size=17, bold=True), 3)
         hh.addWidget(label("Action", size=17, bold=True), 2)
-        hh.insertSpacing(0, 0)
+        hh.insertWidget(0, sp)
         tv.addWidget(head)
         for i, p in enumerate(ps):
             r = ClosedRow(self, p, last=(i == len(ps) - 1))
@@ -398,25 +442,28 @@ class ProfilesPage(QWidget):
         if narrow == self._bar_narrow:
             return
         self._bar_narrow = narrow
-        for w in (self.search, self.filter, self.seg, self.addbtn):
+        for w in (self.search, self.bfilter, self.filter, self.seg, self.addbtn):
             self.bar.removeWidget(w)
-        for c in range(5):
+        for c in range(6):
             self.bar.setColumnStretch(c, 0)
-        if narrow:  # two rows: search full width, then filter + view + add
-            self.bar.addWidget(self.search, 0, 0, 1, 4)
+        if narrow:  # two rows: search + browsers, then status + view + add
+            self.bar.addWidget(self.search, 0, 0, 1, 3)
+            self.bar.addWidget(self.bfilter, 0, 3, 1, 2)
             self.bar.addWidget(self.filter, 1, 0)
             self.bar.addWidget(self.seg, 1, 1)
-            self.bar.addWidget(self.addbtn, 1, 3)
+            self.bar.addWidget(self.addbtn, 1, 4)
             self.bar.setColumnStretch(0, 1)
-            self.bar.setColumnStretch(2, 0)
+            self.bar.setColumnStretch(2, 1)
         else:
             self.bar.addWidget(self.search, 0, 0)
-            self.bar.addWidget(self.filter, 0, 1)
-            self.bar.addWidget(self.seg, 0, 2)
-            self.bar.addWidget(self.addbtn, 0, 4)
+            self.bar.addWidget(self.bfilter, 0, 1)
+            self.bar.addWidget(self.filter, 0, 2)
+            self.bar.addWidget(self.seg, 0, 3)
+            self.bar.addWidget(self.addbtn, 0, 5)
             self.bar.setColumnStretch(0, 3)
             self.bar.setColumnStretch(1, 2)
-            self.bar.setColumnStretch(3, 1)
+            self.bar.setColumnStretch(2, 2)
+            self.bar.setColumnStretch(4, 1)
 
     def _update_cols(self):
         self._layout_bar(self.width() < 900)

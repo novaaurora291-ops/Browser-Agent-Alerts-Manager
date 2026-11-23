@@ -86,6 +86,7 @@ def next_profile_dir():
 
 
 # ---------------- managed profiles (own --user-data-dir, any Chromium browser such as Cent Browser) ----------------
+@__import__("functools").lru_cache(maxsize=64)
 def browser_name(exe):
     """Product name of a browser exe (e.g. 'Cent Browser'), from its version info; falls back to the file name."""
     if not exe:
@@ -319,3 +320,78 @@ def capture(hwnd, max_w=520, max_h=330):
     except Exception as e:
         log(f"capture {hwnd}: {e}")
         return None
+
+
+# ---------- show a profile's real browser window inside the Manager ----------
+GWL_STYLE = -16
+GWL_EXSTYLE = -20
+WS_CHILD = 0x40000000
+WS_POPUP = 0x80000000
+WS_CAPTION = 0x00C00000
+WS_THICKFRAME = 0x00040000
+WS_MINIMIZEBOX = 0x00020000
+WS_MAXIMIZEBOX = 0x00010000
+WS_SYSMENU = 0x00080000
+WS_EX_APPWINDOW = 0x00040000
+
+user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+user32.SetParent.restype = wintypes.HWND
+user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
+
+
+def is_window(hwnd):
+    return bool(hwnd) and bool(user32.IsWindow(hwnd))
+
+
+def embed(hwnd, parent):
+    """Re-parent a browser's own top-level window into one of our widgets. The browser keeps running as itself
+    (same process, same profile, same signed-in session); we only host its window. Returns state for unembed."""
+    import win32gui
+    import win32con
+    if win32gui.IsIconic(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    elif win32gui.GetWindowPlacement(hwnd)[1] == win32con.SW_SHOWMAXIMIZED:
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    st = {"style": user32.GetWindowLongPtrW(hwnd, GWL_STYLE), "ex": user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
+          "rect": win32gui.GetWindowRect(hwnd)}
+    style = (st["style"] & ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)) | WS_CHILD
+    user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style)
+    user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, st["ex"] & ~WS_EX_APPWINDOW)
+    user32.SetParent(hwnd, parent)
+    win32gui.SetWindowPos(hwnd, 0, 0, 0, 0, 0, win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED | win32con.SWP_SHOWWINDOW)
+    return st
+
+
+def embed_resize(hwnd, w, h):
+    import win32gui
+    try:
+        win32gui.MoveWindow(hwnd, 0, 0, max(1, w), max(1, h), True)
+    except Exception:
+        pass
+
+
+def unembed(hwnd, st):
+    """Give the window back to the desktop exactly as it was."""
+    import win32gui
+    import win32con
+    if not is_window(hwnd):
+        return
+    try:
+        user32.SetParent(hwnd, None)
+        user32.SetWindowLongPtrW(hwnd, GWL_STYLE, st["style"])
+        user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, st["ex"])
+        l, t, r, b = st["rect"]
+        win32gui.SetWindowPos(hwnd, 0, l, t, r - l, b - t, win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED | win32con.SWP_SHOWWINDOW)
+    except Exception as e:
+        log(f"unembed {hwnd}: {e}")
+
+
+def window_title(hwnd):
+    import win32gui
+    try:
+        return win32gui.GetWindowText(hwnd)
+    except Exception:
+        return ""
