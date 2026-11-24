@@ -69,6 +69,8 @@ class Controller(QObject):
     team_changed = Signal()            # Shared Repo Team saved / worktrees verified
     verify_done = Signal(str, dict)    # verify id, result
     dispatch_update = Signal(str, dict)  # dispatch id, record
+    refresh_progress = Signal(int, int)  # profiles fully answered, profiles asked (Profiles page Refresh)
+    refresh_done = Signal(dict)          # profile_dir -> {"vpn", "activity", "limit"}: fresh value or "unknown"
 
     def __init__(self):
         super().__init__()
@@ -82,6 +84,7 @@ class Controller(QObject):
         self.sent_keys = {}   # (tag, url, sha256(prompt)) -> dispatch id: the same prompt is never sent twice
         self.worktrees_ok = {}  # alias -> (ok, reason) from the last git check
         self.cent_error = ""
+        self.fr = {}          # last Profiles-page Refresh: {"t0", "end", "running", "res": {dir: {check: value}}}
         self.profiles = []
         self.by_email = {}
         self.by_tag = {}
@@ -239,7 +242,25 @@ class Controller(QObject):
         tabs = self.live_tabs(p)
         return any(h.get("working") or h.get("running") for h in tabs)
 
+    def fresh_unknown(self, p, check):
+        """True when the last Refresh got no fresh answer for this check ("vpn", "activity", "limit") of this
+        profile and nothing newer has come in since: the card shows Unknown instead of an older value."""
+        fr = self.fr
+        if not fr or fr.get("running") or not fr.get("end"):
+            return False
+        r = (fr.get("res") or {}).get(p.directory)
+        if not r or r.get(check) != "unknown":
+            return False
+        st = self.state.get(p.directory) or {}
+        if check == "activity":
+            return st.get("full_t", 0) < fr["end"]
+        if check == "vpn":
+            return st.get("vpn_t", 0) < fr["end"]
+        return True
+
     def status(self, p):
+        if (self.windows.get(p.directory) or p.directory in self.embedded) and self.fresh_unknown(p, "activity"):
+            return "Unknown"
         # RUNNING wins: if Hark shows a running task in this profile (live pill, Stop button, Working badge,
         # "Waiting for your task to finish", or the user's message is last) the profile is Working.
         if self.is_working(p):
@@ -291,6 +312,8 @@ class Controller(QObject):
         st = self.state.get(p.directory) or {}
         if not self.windows.get(p.directory) and p.directory not in self.embedded:
             return "unknown", "browser band hai"
+        if self.fresh_unknown(p, "vpn"):
+            return "unknown", "Refresh mein is profile ka VPN jawab time par nahi aaya"
         if not st or time.time() - st.get("vpn_t", 0) > 90:
             return "unknown", "bridge se VPN status nahi mila"
         v = st.get("vpn") or {}
@@ -440,10 +463,12 @@ class Controller(QObject):
                 QTimer.singleShot(0, self.changed.emit)
         if rep.get("vpn_only"):
             st["t"] = rep["_t"]
+            st["vpn_fresh_t"] = rep["_t"]          # answer to vpn_check: a fresh IP / proxy look
             return False
         if rep.get("limit_result") is not None:      # answer to Check Limit: not a tab/state report
             st["t"] = rep["_t"]
             st["checking"] = 0
+            self._fr_limit(p, rep["limit_result"])
             self.limit_result.emit(p.directory, rep["limit_result"])
             return False
         # an older bridge copy is running in this profile: ask it to reload itself (at most once a minute)
@@ -462,6 +487,7 @@ class Controller(QObject):
         if time.time() - st["t"] >= STALE:
             st["live_since"] = time.time()  # bridge (re)connected: give alerts a fresh grace window
         st["t"] = rep["_t"]
+        st["full_t"] = rep["_t"]                     # a tab / Hark state report (not a VPN or Check Limit answer)
         st["tabs"] = rep.get("tabs", [])
         live_tabs = {t["id"] for t in st["tabs"]}
         st["hark"] = {k: v for k, v in st["hark"].items() if k in live_tabs}
@@ -737,6 +763,105 @@ class Controller(QObject):
             if done:
                 done(summary)
         QTimer.singleShot(wait_ms, finish)
+
+    # ---------- Profiles page Refresh: fresh VPN + activity + Check Limit for every open profile ----------
+    REFRESH_TIMEOUT = 45      # s: a bridge picks commands up on its next report (Hark tab change or 30 s heartbeat)
+
+    def fresh_refresh(self, timeout=None):
+        """Ask every open Cent profile's bridge, read-only, for a FRESH VPN look (vpn_check), its live Hark state
+        (rescan: every Hark tab re-reports) and the Check Limit probe. Answers that arrive after the command was
+        handed out count; any check without one by the deadline is "unknown" (shown as Unknown, never an older
+        value). Nothing is typed or clicked in Hark. Progress / result: refresh_progress / refresh_done."""
+        if self.fr.get("running"):
+            return False
+        t0 = time.time()
+        self.refresh_windows()
+        ps = [p for p in self.profiles if self.windows.get(p.directory) or p.directory in self.embedded]
+        self.fr = {"t0": t0, "end": None, "running": True, "deadline": t0 + (timeout or self.REFRESH_TIMEOUT),
+                   "res": {p.directory: {"vpn": None, "activity": None, "limit": None} for p in ps},
+                   "cid": {}, "ans": {}}
+        for i, p in enumerate(ps):
+            key = self.bridge_key(p)
+            cid = f"fr{int(t0)}-{i}"
+            self.fr["cid"][cid] = p.directory
+            self.bridge.queue_command(key, {"type": "rescan"})
+            self.bridge.queue_command(key, {"type": "vpn_check"})
+            self.check_limit(p, cid)
+        # closed profiles: nothing can be running there
+        for p in self.profiles:
+            if p.directory not in self.fr["res"] and self.state.get(p.directory):
+                self.state[p.directory]["hark"] = {}
+        log(f"refresh: fresh VPN + activity + limit asked in {len(ps)} open profile(s)")
+        self._fr_t = getattr(self, "_fr_t", None) or QTimer(self, interval=400, timeout=self._fr_tick)
+        self._fr_t.start()
+        self.refresh_progress.emit(0, len(ps))
+        return True
+
+    def _fr_limit(self, p, res):
+        fr = self.fr
+        d = fr.get("cid", {}).get(res.get("id")) if fr.get("running") else None
+        if d == p.directory:
+            fr["res"][d]["limit"] = res
+
+    def _fr_tick(self):
+        fr = self.fr
+        if not fr.get("running"):
+            self._fr_t.stop()
+            return
+        now = time.time()
+        for d, r in fr["res"].items():
+            p = self.profile(d)
+            st = self.state.get(d) or {}
+            if not p:
+                continue
+            key = self.bridge_key(p)
+            if r["vpn"] is None and st.get("vpn_fresh_t", 0) >= fr["t0"]:
+                r["vpn"] = self.vpn(p)
+            if r["activity"] is None:
+                tp = (self.bridge.taken.get(key) or {}).get("rescan", 0)
+                if tp >= fr["t0"] and st.get("full_t", 0) > tp:
+                    # the bridge answered the rescan; give its Hark tabs' own reports a moment to land
+                    fr["ans"].setdefault(d, now)
+                    if now - fr["ans"][d] >= 2.0:
+                        self._fr_activity(p, tp)
+                        r["activity"] = self.status(p)
+        n = sum(1 for r in fr["res"].values() if all(v is not None for v in r.values()))
+        self.refresh_progress.emit(n, len(fr["res"]))
+        if n == len(fr["res"]) or now > fr["deadline"]:
+            self._fr_finish()
+
+    def _fr_activity(self, p, tp):
+        """Keep only the Hark tabs that re-reported after the rescan; alerts follow what they show."""
+        st = self.state.get(p.directory) or {}
+        st["hark"] = {k: v for k, v in (st.get("hark") or {}).items() if v.get("_t", 0) >= tp}
+        waiting = {v.get("qid") for v in st["hark"].values()
+                   if v.get("qid") and (v.get("pending") or v.get("settling")) and not v.get("working")}
+        for a in self.alerts.open_alerts():
+            if a["profile_dir"] == p.directory and a["qid"] not in waiting:
+                self.alerts.resolve(a, "refresh: no longer waiting in Hark")
+        for q in waiting:
+            self.seen[q] = time.time()
+
+    def _fr_finish(self):
+        fr = self.fr
+        self._fr_t.stop()
+        for d, r in fr["res"].items():
+            for k in r:
+                if r[k] is None:
+                    r[k] = "unknown"
+        fr["running"] = False
+        fr["end"] = time.time()
+        out = {}
+        for d, r in fr["res"].items():
+            p = self.profile(d)
+            lim = r["limit"]
+            out[d] = {"name": p.name if p else d, "vpn": r["vpn"] if r["vpn"] == "unknown" else "/".join(x for x in r["vpn"] if x),
+                      "activity": r["activity"], "limit": lim}
+            log(f"refresh result {out[d]['name']}: vpn={out[d]['vpn']} activity={r['activity']} "
+                f"limit={'unknown' if lim == 'unknown' else 'answered'}")
+        log(f"refresh done in {fr['end'] - fr['t0']:.1f}s: {sum(1 for r in fr['res'].values() if 'unknown' in (r['vpn'], r['activity'], r['limit']))} profile(s) with Unknown")
+        self.changed.emit()
+        self.refresh_done.emit(out)
 
     def needs_reply_count(self):
         return len(self.alerts.open_alerts())

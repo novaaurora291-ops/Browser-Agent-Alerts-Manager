@@ -18,6 +18,7 @@ class Bridge:
     def __init__(self):
         self.inbox = queue.Queue()          # authenticated reports for the UI thread
         self.commands = {}                  # profile tag -> [cmd]
+        self.taken = {}                     # profile tag -> {command type: time it was handed out}
         self.tokens = {}                    # profile tag -> secret token (set by the controller)
         self.picked = {}                    # dispatch id -> time its command was handed to the bridge
         self.lock = threading.Lock()
@@ -49,6 +50,8 @@ class Bridge:
             for c in cmds:
                 if c.get("dispatch_id"):
                     self.picked[c["dispatch_id"]] = now
+                # when each kind of command was handed to this profile's bridge (Refresh: answers after it are fresh)
+                self.taken.setdefault(tag or "", {})[c.get("type") or ""] = now
             return cmds
 
     def auth(self, tag, token):

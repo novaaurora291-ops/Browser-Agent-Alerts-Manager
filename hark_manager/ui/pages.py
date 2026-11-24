@@ -465,6 +465,8 @@ class ProfilesPage(QWidget):
         self.relay = _Relay()
         self.relay.result.connect(self.set_result)
         ctl.limit_result.connect(self.on_limit)
+        ctl.refresh_progress.connect(self.on_refresh_progress)
+        ctl.refresh_done.connect(self.on_refresh_done)
         v = QVBoxLayout(self)
         v.setContentsMargins(24, 22, 24, 10)
         v.setSpacing(18)
@@ -475,7 +477,7 @@ class ProfilesPage(QWidget):
         self.refresh_btn = button("  Refresh", "outline", "refresh", 18)
         self.refresh_btn.setMinimumHeight(40)
         self.refresh_btn.setStyleSheet("font-size:15px; padding: 6px 16px;")
-        self.refresh_btn.setToolTip("Sab Cent profiles ka live Hark status dobara check karo")
+        self.refresh_btn.setToolTip("Har open Cent profile ka fresh VPN, Hark activity aur Check Limit (read-only)")
         self.refresh_btn.setAccessibleName("Refresh profile statuses")
         self.refresh_btn.clicked.connect(self.recheck_status)
         head.addWidget(self.refresh_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
@@ -610,19 +612,55 @@ class ProfilesPage(QWidget):
         return f"\U0001F517 Repo: {name} ({n} Linked \u2022 {state})"
 
     def recheck_status(self):
-        """Refresh button: ask every Cent profile's bridge for its live Hark state now, then sync cards + Needs reply."""
+        """Refresh button: for every open Cent profile get a FRESH VPN status, Hark activity (Needs reply / Running /
+        Idle) and the read-only Check Limit result, then sync the cards and the Needs reply panel. A check with
+        no fresh answer in this refresh shows Unknown. Read-only: nothing is typed or clicked in Hark."""
         b = self.refresh_btn
         if not b.isEnabled():
             return
+        if not self.ctl.fresh_refresh():
+            return
         b.setEnabled(False)
         b.setText("  Checking…")
+        for k in self.ctl.fr.get("res", {}):
+            self.set_result(k, "run", "Refreshing…", "VPN · activity · limit")
 
-        def done(summary):
-            b.setText("  Refresh")
-            b.setEnabled(True)
-            b.setToolTip(f"Last check: {summary}")
-            self.rebuild()
-        self.ctl.recheck_all(done)
+    def on_refresh_progress(self, n, total):
+        if not self.refresh_btn.isEnabled():
+            self.refresh_btn.setText(f"  Checking… {n}/{total}")
+
+    def on_refresh_done(self, out):
+        b = self.refresh_btn
+        b.setText("  Refresh")
+        b.setEnabled(True)
+        unk = 0
+        for k, r in out.items():
+            if r["limit"] == "unknown":
+                self.set_result(k, "info", "Limit: Unknown", "Is Refresh mein jawab nahi aaya")
+            if "unknown" in (r["vpn"], r["activity"], r["limit"]):
+                unk += 1
+        counts = {}
+        for k, r in out.items():
+            counts[r["activity"]] = counts.get(r["activity"], 0) + 1
+        summary = ", ".join(f"{a} {n}" for a, n in counts.items()) or "no open profiles"
+        b.setToolTip(f"Last refresh {time.strftime('%H:%M:%S')}: {summary}" + (f" · {unk} with Unknown" if unk else ""))
+        self.rebuild()
+        # what each card shows now (names + results only, no secrets): for checking the Refresh by hand / tests
+        try:
+            import json
+            rows = {}
+            for k, r in out.items():
+                p = self.ctl.profile(k)
+                res = self.results.get(k) or ("", "", "")
+                rows[r["name"]] = {"vpn": r["vpn"], "activity": r["activity"],
+                                   "card_status": self.ctl.status(p) if p else "",
+                                   "card_vpn": " ".join(x for x in self.ctl.vpn(p) if x) if p else "",
+                                   "limit": f"{res[1]} {res[2]}".strip()}
+            with open(os.path.join(config.APPDATA, "last_refresh.json"), "w", encoding="utf-8") as f:
+                json.dump({"t": time.time(), "profiles": rows,
+                           "needs_reply": [a["profile_name"] for a in self.ctl.alerts.open_alerts()]}, f, indent=1)
+        except Exception as e:
+            config.log(f"last_refresh.json: {e}")
 
     def set_tab(self, t):
         self.tab = t
@@ -1012,6 +1050,8 @@ class ProfilesPage(QWidget):
 
     def on_limit(self, k, res):
         cid = res.get("id")
+        fr = self.ctl.fr
+        late = isinstance(cid, str) and cid in (fr.get("cid") or {}) and not fr.get("running")
         if cid in self._checks:
             self._checks.pop(cid, None)
         tabs = [t for t in (res.get("tabs") or []) if t and not t.get("err")]
@@ -1031,6 +1071,8 @@ class ProfilesPage(QWidget):
             out = ("fail", "Not ready", "Hark tab nahi mila")
         else:
             out = ("fail", "Not ready", "Hark chat load nahi hui")
+        if late:
+            out = (out[0], out[1], (out[2] + " · " if out[2] else "") + "late answer, after Refresh")
         config.log(f"check limit {k}: {out[1]} {out[2]} tabs={[(t.get('url','')[:40], t.get('reached'), t.get('loaded'), t.get('active')) for t in tabs]}")
         self.set_result(k, *out)
 

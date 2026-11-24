@@ -83,6 +83,12 @@ class NeedsReplyPanel(QWidget):
             q = label(a["question"], size=16, wrap=True)
             q.setToolTip(a["conv_title"])
             col.addWidget(q)
+            p = self.ctl.profile(a["profile_dir"])
+            if p and self.ctl.status(p) == "Unknown":
+                # the last Refresh got no fresh answer from this profile: the question may be answered by now
+                u = label("Status: Unknown (last Refresh: no fresh answer)", obj="muted", wrap=True)
+                u.setAccessibleName(f"Needs reply status {a['profile_name']}: Unknown")
+                col.addWidget(u)
             b = button("Open task", "outline")
             b.setMinimumHeight(42)
             b.setStyleSheet("font-size:17px")

@@ -61,7 +61,7 @@ class Dot(QWidget):
         p.drawEllipse(1, 1, self.d, self.d)
 
 
-STATUS_COLORS = {"Running": GREEN, "Needs reply": ORANGE, "Idle": GRAY, "Closed": GRAY}
+STATUS_COLORS = {"Running": GREEN, "Needs reply": ORANGE, "Idle": GRAY, "Closed": GRAY, "Unknown": "#B8BDC4"}
 
 _ROBOT = None
 
