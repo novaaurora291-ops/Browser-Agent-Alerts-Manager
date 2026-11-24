@@ -393,6 +393,26 @@ user32.SetParent.restype = wintypes.HWND
 user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
 user32.GetParent.restype = wintypes.HWND
 user32.GetParent.argtypes = [wintypes.HWND]
+user32.SetFocus.restype = wintypes.HWND
+user32.SetFocus.argtypes = [wintypes.HWND]
+user32.GetFocus.restype = wintypes.HWND
+user32.GetAncestor.restype = wintypes.HWND
+user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetWindow.restype = wintypes.HWND
+user32.GetWindow.argtypes = [wintypes.HWND, ctypes.c_uint]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+
+
+class _GUITHREADINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD), ("hwndActive", wintypes.HWND),
+                ("hwndFocus", wintypes.HWND), ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND), ("rcCaret", wintypes.RECT)]
+
+
+user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(_GUITHREADINFO)]
 
 
 # ---------- taskbar buttons (ITaskbarList, plain COM through ctypes) ----------
@@ -580,6 +600,65 @@ def bridge_installed(p, running):
     if running:
         return _proc_has_bridge_flag(p)
     return os.path.isfile(os.path.join(p.data_dir, "_hbm_bridge", "manifest.json"))
+
+
+def embedded_child_at(parent, x, y):
+    """The docked Cent window (a direct child of one of our host widgets) that contains screen point x, y."""
+    import win32gui
+    GW_CHILD, GW_HWNDNEXT = 5, 2
+    c = user32.GetWindow(parent, GW_CHILD)
+    while c:
+        try:
+            if user32.IsWindowVisible(c) and win32gui.GetClassName(c) == "Chrome_WidgetWin_1":
+                l, t, r, b = win32gui.GetWindowRect(c)
+                if l <= x < r and t <= y < b:
+                    return int(c)
+        except Exception:
+            pass
+        c = user32.GetWindow(c, GW_HWNDNEXT)
+    return None
+
+
+def _thread_focus(tid):
+    gi = _GUITHREADINFO()
+    gi.cbSize = ctypes.sizeof(_GUITHREADINFO)
+    if not user32.GetGUIThreadInfo(tid, ctypes.byref(gi)):
+        return None
+    return int(gi.hwndFocus or 0)
+
+
+def focus_embedded(hwnd):
+    """Give the keyboard focus to a docked Cent window. A docked window is a WS_CHILD of our (Qt) window in
+    another process: a click in it never moves the Win32 focus there (Chrome does not SetFocus itself, it waits
+    for WM_ACTIVATE, which child windows never get), so the keys kept going to the Qt top-level. Only done while
+    our window is the foreground window. True when the Cent window (or one of its children) has the focus."""
+    if not is_window(hwnd):
+        return False
+    root = user32.GetAncestor(hwnd, 2)            # GA_ROOT: our window that hosts it
+    if not root or user32.GetForegroundWindow() != root:
+        return False
+    tid = user32.GetWindowThreadProcessId(hwnd, None)
+
+    def has_focus():
+        f = _thread_focus(tid)
+        return bool(f) and (f == hwnd or bool(user32.IsChild(hwnd, f)))
+
+    if has_focus():
+        return True
+    user32.SetFocus(hwnd)          # works directly: SetParent attached our input queue to the browser's thread
+    if has_focus():
+        return True
+    me = ctypes.windll.kernel32.GetCurrentThreadId()
+    try:
+        if user32.AttachThreadInput(me, tid, True):
+            user32.SetFocus(hwnd)
+            user32.AttachThreadInput(me, tid, False)
+    except Exception as e:
+        log(f"focus_embedded {hwnd}: {e}")
+    ok = has_focus()
+    if not ok:
+        log(f"focus_embedded {hwnd}: the browser window did not take the keyboard focus")
+    return ok
 
 
 def reparent(hwnd, parent):

@@ -14,7 +14,7 @@ from PySide6.QtCore import Qt, QTimer, QSettings, QPoint, QRect
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QComboBox, QSlider, QSplitter,
                                QScrollArea, QApplication)
 
-from .browser_view import Host
+from .browser_view import Host, EmbedFocus
 from .widgets import label, button, Dot, VpnBadge
 from .style import build_qss, GREEN, LIME
 from . import icons
@@ -345,9 +345,15 @@ class MultiView(QWidget):
         self.t_status = QTimer(self, interval=3000, timeout=self.refresh_status)
         ctl.changed.connect(self.refresh_status)
         self._save_t = QTimer(self, singleShot=True, interval=400, timeout=self.save_splits)
+        # keyboard focus: a click in a pane's browser gives that browser the keys (EmbedFocus); the pane that had
+        # them last gets them back when this window is activated again (Alt+Tab, taskbar) or after Expand/Collapse
+        self.kb_hwnd = None
+        EmbedFocus.install().listeners.append(self.on_embed_focus)
 
     # ---------- open / close ----------
     def open(self):
+        # activated again by Alt+Tab / the taskbar: the keys go back to the pane that had them (a click decides itself)
+        EmbedFocus.install().activated[int(self.winId())] = self.focus_pane
         if self.isVisible():
             self.showMaximized()
             self.raise_()
@@ -378,6 +384,20 @@ class MultiView(QWidget):
         rest = [d for d in self.saved_order() if d not in cur]
         self.qs.setValue("multiview/order", json.dumps(cur + rest))
         self.qs.sync()
+
+    # ---------- keyboard focus ----------
+    def on_embed_focus(self, hwnd, ok):
+        if any(p.hwnd == hwnd for p in self.panes):
+            self.kb_hwnd = hwnd
+
+    def focus_pane(self, pane=None):
+        """Keys to this pane's browser (default: the one that had them last), if it is shown in the grid."""
+        h = pane.hwnd if pane else self.kb_hwnd
+        p = next((p for p in self.panes if p.hwnd and p.hwnd == h), None)
+        if p and p.isVisible() and chrome.focus_embedded(p.hwnd):
+            self.kb_hwnd = p.hwnd
+            return True
+        return False
 
     def closeEvent(self, e):
         self.release_all()
@@ -571,6 +591,8 @@ class MultiView(QWidget):
         if self.expanded is None:
             self.restore_splits()
         QTimer.singleShot(50, lambda: [p.fit() for p in self.panes])
+        # the keys go to the pane just expanded / collapsed (its browser was hidden or moved meanwhile)
+        QTimer.singleShot(120, lambda: self.focus_pane(pane) if pane in self.panes else None)
 
     def pane_at(self, g):
         for p in self.panes:
