@@ -12,7 +12,7 @@ import time
 
 from PySide6.QtCore import Qt, QTimer, QSettings, QPoint, QRect
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QComboBox, QSlider, QSplitter,
-                               QScrollArea, QApplication)
+                               QScrollArea, QScrollBar, QPushButton, QApplication)
 
 from .browser_view import Host, EmbedFocus
 from .widgets import label, button, Dot, VpnBadge
@@ -69,6 +69,109 @@ class PaneHeader(QFrame):
             self._press = None
             self.setCursor(Qt.OpenHandCursor)
             self.pane.mv.drag_drop(self.pane, g if moved else None)
+
+
+class GridScroll(QScrollArea):
+    """The grid's scroll area. The mouse wheel over a pane header, a splitter gap or a pane message scrolls the
+    whole grid (those events bubble up here). The wheel inside a docked browser is never seen here: Windows
+    delivers it to the browser window under the cursor (its own process) and the pane's Host swallows anything
+    the browser would hand back, so a chat scrolls only itself."""
+    WHEEL_PX = 110                    # pixels per wheel notch (120 units)
+
+    def wheelEvent(self, e):
+        d = e.angleDelta()
+        horiz = bool(e.modifiers() & Qt.ShiftModifier) or (d.x() and not d.y())
+        bar = self.horizontalScrollBar() if horiz else self.verticalScrollBar()
+        delta = (d.y() or d.x())
+        if not delta and not e.pixelDelta().isNull():
+            delta = e.pixelDelta().y() or e.pixelDelta().x()
+            bar.setValue(bar.value() - delta)
+        else:
+            bar.setValue(bar.value() - int(delta * self.WHEEL_PX / 120))
+        e.accept()
+
+
+class GridBar(QFrame):
+    """Always visible "Grid" scrollbar on the right edge, outside the panes (▲ / thumb / ▼). It mirrors the grid
+    scroll area's own vertical bar (kept hidden): dragging it, ▲ / ▼ (one grid row at a time) and the wheel over
+    headers / gaps all move the same value."""
+
+    def __init__(self, mv, inner):
+        super().__init__()
+        self.mv, self.inner = mv, inner
+        self.setObjectName("gridCol")
+        self.setFixedWidth(58)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(7, 8, 7, 8)
+        v.setSpacing(8)
+        cap = QLabel("Grid")
+        cap.setObjectName("gridCap")
+        cap.setAlignment(Qt.AlignCenter)
+        cap.setFixedHeight(32)
+        cap.setAccessibleName("Grid scroll")
+        v.addWidget(cap)
+        self.up = QPushButton("▲")
+        self.up.setObjectName("gridBtn")
+        self.up.setFixedSize(44, 40)
+        self.up.setAutoRepeat(True)
+        self.up.setAutoRepeatDelay(450)
+        self.up.setAutoRepeatInterval(220)
+        self.up.setToolTip("Grid upar scroll (ek row)")
+        self.up.setAccessibleName("Grid scroll up")
+        self.up.clicked.connect(lambda: self.step(-1))
+        v.addWidget(self.up, 0, Qt.AlignHCenter)
+        self.bar = QScrollBar(Qt.Vertical)
+        self.bar.setObjectName("gridBar")
+        self.bar.setAccessibleName("Grid scrollbar")
+        self.bar.setToolTip("Poori grid scroll karein")
+        v.addWidget(self.bar, 1, Qt.AlignHCenter)
+        self.down = QPushButton("▼")
+        self.down.setObjectName("gridBtn")
+        self.down.setFixedSize(44, 40)
+        self.down.setAutoRepeat(True)
+        self.down.setAutoRepeatDelay(450)
+        self.down.setAutoRepeatInterval(220)
+        self.down.setToolTip("Grid neeche scroll (ek row)")
+        self.down.setAccessibleName("Grid scroll down")
+        self.down.clicked.connect(lambda: self.step(1))
+        v.addWidget(self.down, 0, Qt.AlignHCenter)
+        for w in (self.up, self.down, self.bar):
+            w.setFocusPolicy(Qt.NoFocus)        # keys typed for a pane never land on the Grid controls
+        inner.rangeChanged.connect(self.sync_range)
+        inner.valueChanged.connect(self._from_inner)
+        self.bar.valueChanged.connect(self._from_bar)
+        self.sync_range(inner.minimum(), inner.maximum())
+
+    def sync_range(self, lo, hi):
+        self.bar.setRange(lo, hi)
+        self.bar.setPageStep(max(1, self.mv.scroll.viewport().height()))
+        self.bar.setSingleStep(60)
+        self.bar.setValue(self.inner.value())
+        self.bar.setEnabled(hi > lo)
+        self.up.setEnabled(hi > lo)
+        self.down.setEnabled(hi > lo)
+
+    def _from_inner(self, val):
+        if self.bar.value() != val:
+            self.bar.setValue(val)
+
+    def _from_bar(self, val):
+        if self.inner.value() != val:
+            self.inner.setValue(val)
+
+    def wheelEvent(self, e):
+        self.mv.scroll.wheelEvent(e)
+
+    def step(self, direction):
+        """One grid row up / down: the next row starts at the top of the view (the last stop is the bottom)."""
+        cur, hi = self.inner.value(), self.inner.maximum()
+        tops = sorted({r.mapTo(self.mv.canvas, QPoint(0, 0)).y() for r in self.mv.rows if r.isVisible()})
+        if direction > 0:
+            nxt = [t for t in tops if t > cur + 2]
+            self.inner.setValue(min(hi, nxt[0]) if nxt else hi)
+        else:
+            prv = [t for t in tops if t < cur - 2]
+            self.inner.setValue(prv[-1] if prv else 0)
 
 
 class Pane(QFrame):
@@ -239,6 +342,24 @@ class Pane(QFrame):
         except Exception:
             pass
 
+    def visible_rect(self):
+        """Screen rect (device pixels) of this pane's browser area that is on screen: host ∩ grid viewport."""
+        import win32gui
+        try:
+            if not self.host.isVisible():
+                return None
+            l, t, r, b = win32gui.GetWindowRect(int(self.host.winId()))
+            vp = int(self.mv.scroll.viewport().winId())
+            vl, vt = win32gui.ClientToScreen(vp, (0, 0))
+            _, _, vw, vh = win32gui.GetClientRect(vp)
+            l, t, r, b = max(l, vl), max(t, vt), min(r, vl + vw), min(b, vt + vh)
+            return (l, t, r, b) if r > l and b > t else None
+        except Exception:
+            return None
+
+    def clip_popups(self, popups):
+        chrome.clip_popups(popups, self.visible_rect())
+
 
 class MultiView(QWidget):
     def __init__(self, ctl, release_main=None, dock=None):
@@ -261,6 +382,17 @@ class MultiView(QWidget):
             QSlider::groove:horizontal{height:6px;background:#E3E6EA;border-radius:3px;}
             QSlider::sub-page:horizontal{background:#9BEA2C;border-radius:3px;}
             QSlider::handle:horizontal{background:white;border:2px solid #7BD21A;width:16px;margin:-7px 0;border-radius:10px;}
+            QFrame#gridCol{background:#FFFFFF;border-left:1px solid #E3E6EA;}
+            QLabel#gridCap{background:#2A303B;color:white;font-size:15px;font-weight:700;border-radius:7px;}
+            QPushButton#gridBtn{background:#FFFFFF;border:1px solid #CDD1D6;border-radius:9px;font-size:15px;color:#111418;padding:0;}
+            QPushButton#gridBtn:hover{background:#EAF8D2;border-color:#7BD21A;}
+            QPushButton#gridBtn:disabled{color:#B8BDC4;}
+            QScrollBar#gridBar:vertical{width:16px;background:#E9ECEF;border-radius:8px;margin:0;}
+            QScrollBar#gridBar::handle:vertical{background:#9BEA2C;border-radius:8px;min-height:48px;}
+            QScrollBar#gridBar::handle:vertical:hover{background:#8FE01F;}
+            QScrollBar#gridBar::handle:vertical:disabled{background:#D5D9DE;}
+            QScrollBar#gridBar::add-line, QScrollBar#gridBar::sub-line{height:0;}
+            QScrollBar#gridBar::add-page, QScrollBar#gridBar::sub-page{background:transparent;}
         """)
         self.setObjectName("mvRoot")
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -320,8 +452,10 @@ class MultiView(QWidget):
         b.addWidget(self.b_close)
         v.addWidget(bar)
 
-        self.scroll = QScrollArea()
+        self.scroll = GridScroll()
         self.scroll.setWidgetResizable(False)
+        # the vertical bar is the "Grid" column on the right (GridBar); the area's own one stays hidden
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         # a native viewport clips the hosted browser windows to the visible area while scrolling
         self.scroll.viewport().setAttribute(Qt.WA_NativeWindow, True)
@@ -331,7 +465,16 @@ class MultiView(QWidget):
         self.cv = QVBoxLayout(self.canvas)
         self.cv.setContentsMargins(0, 0, 0, 0)
         self.scroll.setWidget(self.canvas)
-        v.addWidget(self.scroll, 1)
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(self.scroll, 1)
+        self.gridbar = GridBar(self, self.scroll.verticalScrollBar())
+        body.addWidget(self.gridbar)
+        v.addLayout(body, 1)
+        # docked browser windows follow the grid at once when it scrolls (their hosts are clipped by the viewport)
+        self.scroll.verticalScrollBar().valueChanged.connect(self.on_scrolled)
+        self.scroll.horizontalScrollBar().valueChanged.connect(self.on_scrolled)
         self.outer = None
 
         lay = self.qs.value("multiview/layout", DEFAULT_LAYOUT)
@@ -345,6 +488,7 @@ class MultiView(QWidget):
         self.t_status = QTimer(self, interval=3000, timeout=self.refresh_status)
         ctl.changed.connect(self.refresh_status)
         self._save_t = QTimer(self, singleShot=True, interval=400, timeout=self.save_splits)
+        self._clip_t = QTimer(self, singleShot=True, interval=150, timeout=self.clip_popups)
         # keyboard focus: a click in a pane's browser gives that browser the keys (EmbedFocus); the pane that had
         # them last gets them back when this window is activated again (Alt+Tab, taskbar) or after Expand/Collapse
         self.kb_hwnd = None
@@ -407,6 +551,7 @@ class MultiView(QWidget):
 
     def release_all(self):
         self.save_splits()
+        chrome.unclip_popups()          # bubbles of windows leaving the grid get their whole area back
         for pane in self.panes:
             if pane.hwnd:
                 self.dock.give_back(pane.hwnd)
@@ -501,6 +646,20 @@ class MultiView(QWidget):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         QTimer.singleShot(0, self.size_canvas)
+
+    def on_scrolled(self, *_):
+        for p in self.panes:
+            if p.hwnd:
+                p.keep_in_place()
+                chrome.notify_moved(p.hwnd)     # its own bubbles re-anchor to where it is now
+        self._clip_t.start()
+
+    def clip_popups(self):
+        """Chrome's bubbles of the docked windows are top-level windows: keep each inside its pane's visible area."""
+        live = [p for p in self.panes if p.hwnd]
+        pops = chrome.owned_popups([p.hwnd for p in live])
+        for p in live:
+            p.clip_popups(pops.get(p.hwnd, []))
 
     # ---------- splitter sizes ----------
     def _split_key(self):
@@ -637,6 +796,7 @@ class MultiView(QWidget):
     def poll(self):
         for p in self.panes:
             p.poll()
+        self.clip_popups()
         if time.time() - getattr(self, "_auto_t", 0) > 2:
             self._auto_t = time.time()
             self.auto_add()

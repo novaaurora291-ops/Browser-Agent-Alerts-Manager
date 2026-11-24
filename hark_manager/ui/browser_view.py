@@ -58,9 +58,24 @@ class EmbedFocus(QAbstractNativeEventFilter):
                 elif m.message == WM_ACTIVATE and (m.wParam & 0xFFFF) == 1 and int(m.hWnd or 0) in self.activated:
                     # WA_ACTIVE (WA_CLICKACTIVE = 2 is left to the click): after Windows focused the window itself
                     QTimer.singleShot(0, self.activated[int(m.hWnd)])
+                elif m.message == WM_ACTIVATE and (m.wParam & 0xFFFF) == 2 and int(m.hWnd or 0) in self.activated:
+                    # activated by a click: when that click landed in a docked browser, its WM_PARENTNOTIFY came
+                    # while our window was not in the foreground yet, so give that browser the keys now
+                    root = int(m.hWnd)
+                    QTimer.singleShot(0, lambda: self.focus_under_cursor(root))
         except Exception as e:
             log(f"embed focus filter: {e}")
         return False, 0
+
+    def focus_under_cursor(self, root):
+        import win32api
+        try:
+            x, y = win32api.GetCursorPos()
+            child = chrome.embedded_window_from_point(x, y, root)
+        except Exception:
+            child = None
+        if child:
+            self.focus(child)
 
     def focus(self, hwnd):
         ok = chrome.focus_embedded(hwnd)
@@ -85,6 +100,11 @@ class Host(QWidget):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self.resized.emit()
+
+    def wheelEvent(self, e):
+        # a wheel over the docked browser belongs to that browser only (its chat scrolls); anything the browser
+        # passes back to its parent window must not scroll the Multi-View grid around it
+        e.accept()
 
 
 class BrowserView(QWidget):

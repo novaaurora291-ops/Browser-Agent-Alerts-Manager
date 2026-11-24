@@ -619,6 +619,22 @@ def embedded_child_at(parent, x, y):
     return None
 
 
+def embedded_window_from_point(x, y, root):
+    """The docked Cent window (child of one of our hosts, inside top-level root) under screen point x, y."""
+    import win32gui
+    w = user32.WindowFromPoint(wintypes.POINT(x, y))
+    while w:
+        par = user32.GetParent(w)
+        try:
+            if par and win32gui.GetClassName(w) == "Chrome_WidgetWin_1" and win32gui.GetClassName(par) != "Chrome_WidgetWin_1" \
+                    and user32.GetAncestor(w, 2) == root:
+                return int(w)
+        except Exception:
+            return None
+        w = par
+    return None
+
+
 def _thread_focus(tid):
     gi = _GUITHREADINFO()
     gi.cbSize = ctypes.sizeof(_GUITHREADINFO)
@@ -659,6 +675,84 @@ def focus_embedded(hwnd):
     if not ok:
         log(f"focus_embedded {hwnd}: the browser window did not take the keyboard focus")
     return ok
+
+
+_clipped = {}     # popup hwnd -> rect (window coords) it is clipped to, or () for fully hidden
+
+
+def owned_popups(owners):
+    """{owner hwnd: [visible top-level popup hwnds it owns]} for docked Cent windows: Chrome's own bubbles
+    ('Restore pages?', permission prompts, menus) are separate top-level windows owned by the docked window."""
+    import win32gui
+    owners = set(int(h) for h in owners if h)
+    out = {h: [] for h in owners}
+    if not owners:
+        return out
+
+    def cb(w, _):
+        try:
+            o = int(user32.GetWindow(w, 4) or 0)          # GW_OWNER
+            if o in owners and user32.IsWindowVisible(w):
+                out[o].append(int(w))
+        except Exception:
+            pass
+        return True
+    try:
+        win32gui.EnumWindows(cb, None)
+    except Exception:
+        pass
+    return out
+
+
+def notify_moved(hwnd):
+    """A docked window moved on screen together with its host (e.g. the grid scrolled): its position relative to
+    the host did not change, so the browser was not told. WM_MOVE makes it re-anchor its bubbles to where it is."""
+    try:
+        user32.PostMessageW(hwnd, 0x0003, 0, 0)
+    except Exception:
+        pass
+
+
+def clip_popups(popups, vis):
+    """Clip the docked window's popups to vis (screen rect l, t, r, b of the pane area that is on screen; None when
+    none is), so no bubble floats over the Manager's header bar, the Grid scrollbar or another pane."""
+    import win32gui
+    for w in popups:
+        try:
+            l, t, r, b = win32gui.GetWindowRect(w)
+        except Exception:
+            continue
+        if vis and l >= vis[0] and t >= vis[1] and r <= vis[2] and b <= vis[3]:
+            if w in _clipped:
+                user32.SetWindowRgn(w, None, True)
+                _clipped.pop(w, None)
+            continue
+        if vis:
+            cl, ct, cr, cb_ = max(l, vis[0]) - l, max(t, vis[1]) - t, min(r, vis[2]) - l, min(b, vis[3]) - t
+            rect = (cl, ct, cr, cb_) if cr > cl and cb_ > ct else ()
+        else:
+            rect = ()
+        if _clipped.get(w) == rect:
+            continue
+        gdi = ctypes.windll.gdi32
+        gdi.CreateRectRgn.restype = ctypes.c_void_p
+        rgn = gdi.CreateRectRgn(*(rect or (0, 0, 0, 0)))
+        if rgn and user32.SetWindowRgn(w, ctypes.c_void_p(rgn), True):
+            _clipped[w] = rect          # the system owns the region now
+        elif rgn:
+            gdi.DeleteObject(ctypes.c_void_p(rgn))
+
+
+def unclip_popups(popups=None):
+    """Give popups their whole area back (the window left the grid). None: every popup clipped so far."""
+    for w in list(_clipped) if popups is None else popups:
+        if w in _clipped:
+            try:
+                if is_window(w):
+                    user32.SetWindowRgn(w, None, True)
+            except Exception:
+                pass
+            _clipped.pop(w, None)
 
 
 def reparent(hwnd, parent):
