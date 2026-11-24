@@ -10,7 +10,7 @@ from . import icons
 from .widgets import label, button
 from .style import LIME, LIME_SOFT, LIME_BORDER, BORDER, MUTED, GREEN
 from .. import chrome as chrome_mod
-from ..setup import ProfileSetup
+from ..setup import ProfileSetup, parse_dob
 
 DLG_QSS = f"""
 QDialog {{ background: white; }}
@@ -256,10 +256,19 @@ class AddProfileDialog(QDialog):
         self.paste = QPlainTextEdit()
         self.paste.setPlaceholderText("test1@example.com|password\ntest2@example.com|password")
         self.paste.setMinimumHeight(130)
+        self.paste.setAccessibleName("Paste accounts")
         self.paste.textChanged.connect(self._on_paste)
         form.addWidget(self.paste)
         self.ready = label("", bold=True)
         form.addWidget(self.ready)
+
+        self.l_dob = fl("Birthday (agar Hark poochhe)")
+        form.addWidget(self.l_dob)
+        self.dob = QLineEdit(str(self.ctl.settings.get("signin_dob") or ""))
+        self.dob.setPlaceholderText("YYYY-MM-DD · Hark ke age check par khud fill hoga")
+        self.dob.setAccessibleName("Birthday")
+        self.dob.textChanged.connect(self._validate)
+        form.addWidget(self.dob)
 
         self.l_manual = label("Manual: har profile mein Hark ka sign-in page khul jayega, login aap khud karenge.", wrap=True, color=MUTED)
         form.addWidget(self.l_manual)
@@ -341,6 +350,8 @@ class AddProfileDialog(QDialog):
         for w in (self.l_paste, self.l_paste_hint, self.paste, self.ready):
             w.setVisible(auto and multi)
         self.l_manual.setVisible(not auto)
+        for w in (self.l_dob, self.dob):
+            w.setVisible(auto)
         self.b_auto.setIcon(icons.icon("radioon" if auto else "radio", 20))
         self.b_manual.setIcon(icons.icon("radio" if auto else "radioon", 20))
         self.steps_title.setText("Setup per profile" if multi else "Setup order")
@@ -405,6 +416,11 @@ class AddProfileDialog(QDialog):
 
     def _validate(self):
         if self.running or self.finished_all:
+            return
+        dob_bad = self.auto() and bool(self.dob.text().strip()) and not parse_dob(self.dob.text())
+        self.dob.setStyleSheet("border:1px solid #C62828" if dob_bad else "")
+        if dob_bad:
+            self.create.setEnabled(False)
             return
         if not self.multi():
             self.create.setText("Create profile")
@@ -481,7 +497,7 @@ class AddProfileDialog(QDialog):
         for w in (self.name, self.email, self.pw, self.b_auto, self.b_manual, self.t_single, self.t_multi):
             w.setEnabled(False)
         self.running = True
-        self.setup = ProfileSetup(self.ctl, p, "auto" if auto else "manual", email, pw)
+        self.setup = ProfileSetup(self.ctl, p, "auto" if auto else "manual", email, pw, self._save_dob())
         del pw
         self.setup.step.connect(lambda n, st, t: self.rows[n].set_state(st, t))
         self.setup.field.connect(self.on_field)
@@ -524,8 +540,21 @@ class AddProfileDialog(QDialog):
         self.create.setText("Setting up…")
         self.cancel.setText("Stop")
         self.mode_str = "auto" if auto else "manual"
+        self.dob_val = self._save_dob()
+        self.dob.setEnabled(False)
         self.adjustSize()
         QTimer.singleShot(100, self.next_profile)
+
+    def _save_dob(self):
+        """Remember the batch birthday for next time (only a date, used for Hark's age check)."""
+        v = self.dob.text().strip() if self.auto() else ""
+        if v and parse_dob(v) and self.ctl.settings.get("signin_dob") != v:
+            try:
+                self.ctl.settings["signin_dob"] = v
+                self.ctl.settings.save()
+            except Exception:
+                pass
+        return v
 
     def next_profile(self):
         if not self.running:
@@ -548,7 +577,7 @@ class AddProfileDialog(QDialog):
         row.p = p
         row.set(1, "ok", "Profile ban gaya")
         pw = self._pws.pop(job["email"].lower(), "") if job["email"] else ""
-        self.setup = ProfileSetup(self.ctl, p, self.mode_str, job["email"], pw)
+        self.setup = ProfileSetup(self.ctl, p, self.mode_str, job["email"], pw, self.dob_val)
         del pw
         self.setup.step.connect(lambda n, st, t, row=row: row.set(n + 1, st, t))
         self.setup.field.connect(self.on_field)

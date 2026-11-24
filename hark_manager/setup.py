@@ -107,15 +107,36 @@ class Session:
             pass
 
 
+def parse_dob(text):
+    """'1999-05-12' -> (1999, 5, 12); anything else -> None."""
+    import datetime
+    try:
+        d = datetime.date.fromisoformat((text or "").strip())
+        return (d.year, d.month, d.day) if 1900 <= d.year <= datetime.date.today().year - 13 else None
+    except Exception:
+        return None
+
+
+BIRTHDAY_JS = """(()=>{const v=%s;const ss=[...document.querySelectorAll('select')];if(ss.length<3)return 'wait';
+const set=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set;
+for(const s of ss){const k=(s.getAttribute('aria-label')||s.name||s.id||'');
+ const key=/month/i.test(k)?'m':/day/i.test(k)?'d':/year/i.test(k)?'y':null;if(!key)return 'nolabel';
+ if(![...s.options].some(o=>o.value===v[key]))return 'noopt';
+ set.call(s,v[key]);s.dispatchEvent(new Event('input',{bubbles:true}));s.dispatchEvent(new Event('change',{bubbles:true}));}
+const b=[...document.querySelectorAll('button')].find(x=>/continue/i.test(x.innerText)&&!x.disabled);
+if(!b)return 'nobtn';b.click();return 'ok'})()"""
+
+
 class ProfileSetup(QObject):
     step = Signal(int, str, str)      # step number (1..3), state (wait|run|ok|user|fail|skip), text
     finished = Signal(bool, str)
     field = Signal(str, str, object)  # (tag, key, value) saved on the GUI thread
 
-    def __init__(self, ctl, profile, mode, email="", password=""):
+    def __init__(self, ctl, profile, mode, email="", password="", dob=""):
         super().__init__()
         self.ctl, self.p, self.mode = ctl, profile, mode
         self.email = email.strip()
+        self.dob = parse_dob(dob)    # (year, month, day) or None
         self._pw = password
         self.stopped = False
         self.cent = "cent" in (profile.browser_name or "").lower()
@@ -453,7 +474,7 @@ class ProfileSetup(QObject):
         return False
 
     def _wait_signed_in(self):
-        end = time.time() + 900
+        end = time.time() + 1800
         last = ""
         while time.time() < end:
             pages = self.cdp.pages()
@@ -486,7 +507,10 @@ class ProfileSetup(QObject):
                     elif self.mode == "manual" and not note:
                         note = "user:Cent window mein Google sign-in complete karein"
                 elif "hark.com/verify-age" in u:
-                    note = "user:Hark birthday maang raha hai: Cent window mein bhar dein"
+                    note = self._birthday(t)
+            if last.startswith("user:") and not note.startswith("user:") and not any(
+                    "/challenge/" in u for u in urls):
+                note = note or "Verification ho gayi, setup resume…"
             if note and note != last:
                 last = note
                 if note.startswith("user:"):
@@ -495,13 +519,32 @@ class ProfileSetup(QObject):
                 else:
                     self._say(3, "run", note)
             self._sleep(2)
-        self._say(3, "fail", "15 min mein sign-in mukammal nahi hua")
+        self._say(3, "fail", "30 min mein sign-in mukammal nahi hua")
         raise RuntimeError("sign-in timeout")
+
+    def _birthday(self, t):
+        """Hark's age check: fill the batch birthday and press Continue (auto mode only)."""
+        if self.mode != "auto" or not self.dob:
+            return "user:Hark birthday maang raha hai: Cent window mein bhar dein"
+        tries = self.__dict__.setdefault("_bd_tries", [0])
+        if tries[0] >= 3:
+            return "user:Birthday auto-fill nahi chala: Cent window mein bhar dein"
+        y, m, d = self.dob
+        s = self.cdp.session(t)
+        try:
+            r = s.js(BIRTHDAY_JS % json.dumps({"y": str(y), "m": str(m), "d": str(d)}))
+        finally:
+            s.close()
+        if r == "wait":
+            return ""
+        tries[0] += 1
+        log(f"setup {self.p.tag}: birthday fill -> {r}")
+        return "Hark birthday (age check) auto-fill, Continue…" if r == "ok" else ""
 
     def _done(self, s):
         em = ""
         try:
-            em = s.js("""(async()=>{for(const u of ['/api/auth/session','/api/me','/api/user']){try{const r=await fetch(u,{credentials:'include'});if(r.ok){const t=await r.text();const m=t.match(/[\\w.+-]+@[\\w-]+\\.[\\w.]+/);if(m)return m[0]}}catch(e){}}return ''})()""") or ""
+            em = s.js("""(async()=>{for(const u of ['/api/auth/get-session','/api/auth/session','/api/me']){try{const r=await fetch(u,{credentials:'include'});if(r.ok){const t=await r.text();const m=t.match(/[\\w.+-]+@[\\w-]+\\.[\\w.]+/);if(m)return m[0]}}catch(e){}}return ''})()""") or ""
         except Exception:
             pass
         em = em or self.email
