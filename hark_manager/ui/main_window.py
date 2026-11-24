@@ -235,14 +235,7 @@ class MainWindow(QMainWindow):
         self.settings.ask_secure(msg)
 
     def install_bridge(self, directory):
-        from ..installer import install_bridge
-        p = self.ctl.profile(directory)
-        if not p:
-            return
-        if QMessageBox.question(self, "Hark bridge", f"'{p.name}' profile mein Hark bridge extension install karoon? Chrome ka Extensions page khulega aur 'Load unpacked' se folder load hoga.") != QMessageBox.Yes:
-            return
-        ok, msg = install_bridge(p, config.ensure_extension())
-        QMessageBox.information(self, "Hark bridge", msg)
+        self.profiles.run_install([directory])
 
     def show_normal(self):
         self.showNormal()

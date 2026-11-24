@@ -25,6 +25,7 @@ QPushButton#nav:hover {{ background: #EEF0F2; }}
 QPushButton#nav:checked {{ background: {LIME_SOFT}; }}
 QLabel#badge {{ background: {ORANGE}; color: #1b1300; border-radius: 11px; font-weight: 700; font-size: 12px; min-width: 22px; max-width: 22px; min-height: 22px; max-height: 22px; qproperty-alignment: AlignCenter; }}
 QFrame#card {{ background: {CARD}; border: 1px solid {BORDER}; border-radius: 14px; }}
+QFrame#cardSel {{ background: #F4FCE8; border: 2px solid {LIME}; border-radius: 14px; }}
 QFrame#cardAlert {{ background: {CARD}; border: 2px solid {ORANGE}; border-radius: 14px; }}
 QPushButton#primary {{ background: {LIME}; border: none; border-radius: 9px; padding: 9px 18px; font-size: 15px; font-weight: 600; }}
 QPushButton#primary:hover {{ background: #8FE01F; }}

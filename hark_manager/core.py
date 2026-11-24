@@ -2,7 +2,7 @@
 import threading
 import os
 import time
-EXT_VERSION = "1.0.6"
+EXT_VERSION = "1.0.7"
 ALERT_GRACE = 15  # an alert Hark no longer shows as waiting (live DOM) is cleared after this many seconds
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -30,6 +30,7 @@ class Controller(QObject):
     new_alert = Signal(dict)           # fresh alert -> desktop notification
     telegram_status = Signal(bool, str)
     need_telegram_setup = Signal(str)
+    limit_result = Signal(str, dict)   # profile_dir, read-only Hark limit probe from the bridge
     view_request = Signal(str, str)    # profile_dir, preferred window title -> show it inside the Manager
 
     def __init__(self):
@@ -139,6 +140,10 @@ class Controller(QObject):
             return "Closed"
         return "Idle"
 
+    def check_limit(self, p, cid):
+        """Ask this profile's bridge for a read-only look at its Hark tab (limit popup / message box)."""
+        self.bridge.queue_command(self.bridge_key(p), {"type": "check_limit", "id": cid})
+
     def bridge_live(self, p):
         st = self.state.get(p.directory)
         return bool(st and time.time() - st["t"] < STALE)
@@ -227,9 +232,17 @@ class Controller(QObject):
                 self.settings.save()
                 log(f"managed profile {p.tag} bridge connected")
         st = self.state.setdefault(p.directory, {"t": 0, "tabs": [], "hark": {}, "email": email})
+        if rep.get("limit_result") is not None:      # answer to Check Limit: not a tab/state report
+            st["t"] = rep["_t"]
+            self.limit_result.emit(p.directory, rep["limit_result"])
+            return False
         # an older bridge copy is running in this profile: ask it to reload itself (at most once a minute)
         if rep.get("ver") != EXT_VERSION and time.time() - st.get("reload_asked", 0) > 60:
             st["reload_asked"] = time.time()
+            try:   # put the current files where this profile loads the bridge from, then let it reload itself
+                config.ensure_profile_extension(p.data_dir, p.tag) if p.managed else config.ensure_extension()
+            except Exception as e:
+                log(f"bridge files update {p.directory}: {e}")
             self.bridge.queue_command(self.bridge_key(p), {"type": "reload_ext"})
             log(f"bridge in {p.directory} is {rep.get('ver')}, asked to reload to {EXT_VERSION}")
         if time.time() - st["t"] >= STALE:

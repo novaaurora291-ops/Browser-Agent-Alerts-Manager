@@ -401,3 +401,55 @@ def window_title(hwnd):
         return win32gui.GetWindowText(hwnd)
     except Exception:
         return ""
+
+
+def _ext_records(prefs_dir):
+    """Bridge extension entries in a profile's Preferences (read only)."""
+    import json
+    out = []
+    for fn in ("Preferences", "Secure Preferences"):
+        fp = os.path.join(prefs_dir, fn)
+        try:
+            with open(fp, encoding="utf-8") as f:
+                st = ((json.load(f).get("extensions") or {}).get("settings") or {})
+        except Exception:
+            continue
+        for k, v in st.items():
+            path = (v.get("path") or "").replace("/", "\\").rstrip("\\").lower()
+            if path.endswith("\\_hbm_bridge") or path.endswith("\\bridge_extension"):
+                out.append({"id": k, "location": v.get("location"), "state": v.get("state", 1), "path": path})
+    return out
+
+
+def _proc_has_bridge_flag(p):
+    """True if the running browser for this profile was started with --load-extension=<bridge folder>."""
+    try:
+        import psutil
+        want = norm_dir(p.data_dir) if p.managed else None
+        for pr in psutil.process_iter(["name", "cmdline"]):
+            cl = pr.info.get("cmdline") or []
+            if not cl or any(a.startswith("--type=") for a in cl):
+                continue
+            if want and not any(a.startswith("--user-data-dir=") and norm_dir(a.split("=", 1)[1].strip('"')) == want for a in cl):
+                continue
+            if not want:
+                continue
+            if any(a.startswith("--load-extension=") and ("_hbm_bridge" in a or "bridge_extension" in a) for a in cl):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def bridge_installed(p, running):
+    """Is the Hark bridge in this profile? Unpacked (persistent) record always counts; a command-line copy
+    counts only if the running browser actually carries the flag (or, closed + managed, the Manager adds it at launch)."""
+    prefs = os.path.join(p.data_dir, "Default") if p.managed else os.path.join(USER_DATA, p.directory)
+    recs = [r for r in _ext_records(prefs) if r["state"] == 1]
+    if any(r["location"] == 4 for r in recs):
+        return True
+    if p.managed:
+        if running:
+            return _proc_has_bridge_flag(p)
+        return os.path.isfile(os.path.join(p.data_dir, "_hbm_bridge", "manifest.json"))
+    return False

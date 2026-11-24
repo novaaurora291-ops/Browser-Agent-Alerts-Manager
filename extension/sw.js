@@ -27,6 +27,45 @@ async function post(path, body) {
   const r = await fetch(APP + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   return r.json();
 }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+// READ-ONLY look at a Hark tab: limit popup, reset time, chat loaded, message box active. Clicks/typing nothing.
+function hbmLimitProbe() {
+  const shown = el => { for (let a = el, i = 0; a && i < 8; a = a.parentElement, i++) { const cs = getComputedStyle(a); if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0) return false; } const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const LIM = /reached your (daily |weekly |monthly |usage )*limit/i;
+  const hits = Array.from(document.querySelectorAll("body *")).filter(e => { const t = e.textContent || ""; return t.length < 500 && LIM.test(t) && !Array.from(e.children).some(k => LIM.test(k.textContent || "")) && shown(e); });
+  let reached = hits.length > 0, reset = "";
+  if (reached) {
+    let c = hits[0];
+    for (let i = 0; i < 10 && c && !/\breset/i.test(c.innerText || ""); i++) c = c.parentElement;
+    const t = c ? (c.innerText || "") : "";
+    for (const m of t.matchAll(/resets?\s*(?:at|on|in)?[\s:]*([^\n]{2,40})/gi)) { if (/\d/.test(m[1])) { reset = m[1].trim(); break; } }
+  }
+  const ed = Array.from(document.querySelectorAll("textarea, [contenteditable=true], [role=textbox]")).find(e => shown(e) && e.getBoundingClientRect().width > 80);
+  const active = !!ed && !ed.disabled && !ed.readOnly && ed.getAttribute("aria-disabled") !== "true" && !ed.closest("[inert],[aria-disabled=true],fieldset[disabled]");
+  const p = location.pathname;
+  const signin = /sign-?in|login|verify-age/i.test(p) || !!document.querySelector("iframe[src*=framed-sign-in]");
+  const loaded = !signin && document.readyState === "complete" && (p.startsWith("/chat") || p.startsWith("/project")) && !!(document.querySelector("[data-testid=message-list]") || ed);
+  return { reached, reset, composer: !!ed, active, loaded, signin, url: location.href.split("#")[0] };
+}
+async function checkLimit(c) {
+  let tabs = (await chrome.tabs.query({ url: "https://hark.com/*" })).filter(t => !/\/(framed-)?sign-in/.test(t.url || ""));
+  let opened = null;
+  if (!tabs.length) {   // no Hark tab: look in a background tab, then close it again
+    opened = await chrome.tabs.create({ url: "https://hark.com/chat", active: false });
+    for (let i = 0; i < 40; i++) { await sleep(500); const t = await chrome.tabs.get(opened.id); if (t.status === "complete") break; }
+    await sleep(5000);
+    tabs = [await chrome.tabs.get(opened.id)];
+  }
+  const out = [];
+  for (const t of tabs) {
+    try { const [r] = await chrome.scripting.executeScript({ target: { tabId: t.id }, func: hbmLimitProbe }); out.push(r.result); }
+    catch (e) { out.push({ err: String(e), url: t.url }); }
+  }
+  if (opened) { try { await chrome.tabs.remove(opened.id); } catch (e) {} }
+  const body = { email: await getEmail(), tag: await getTag(), ext_id: chrome.runtime.id, ver: chrome.runtime.getManifest().version,
+                 tabs: [], windows: [], hark: null, limit_result: { id: c.id, tabs: out, opened: !!opened } };
+  await post("/report", body);
+}
 async function runCommands(cmds) {
   for (const c of cmds || []) {
     try {
@@ -44,6 +83,8 @@ async function runCommands(cmds) {
       } else if (c.type === "focus") {
         const w = await chrome.windows.getLastFocused();
         await chrome.windows.update(w.id, { focused: true, state: "normal" });
+      } else if (c.type === "check_limit") {
+        await checkLimit(c);
       } else if (c.type === "reload_ext") {
         chrome.runtime.reload();
       } else if (c.type === "reload_hark") {

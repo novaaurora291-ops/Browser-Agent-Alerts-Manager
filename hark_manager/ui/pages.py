@@ -1,10 +1,12 @@
 import os
 import time
 
-from PySide6.QtCore import Qt, Signal, QTimer, QEvent
+import threading
+
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QRect, QObject
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox, QPushButton,
                                QScrollArea, QFrame, QMenu, QInputDialog, QButtonGroup, QLineEdit, QMessageBox,
-                               QSizePolicy, QApplication, QFileDialog)
+                               QSizePolicy, QApplication, QFileDialog, QRubberBand)
 
 from . import icons
 from .widgets import card, label, button, StatusLabel, Toggle, SearchBox, Preview, IconLabel, Dot
@@ -28,7 +30,66 @@ def ago(ts):
 
 
 # ======================= Profiles =======================
-class ProfileCard(QFrame):
+BADGE = {   # result pill on a card: (background, text colour)
+    "limit": ("#FDE2E0", "#C62828"), "ready": ("#DDF5D0", "#1E7B1E"), "ok": ("#EAF8D2", "#2E6B00"),
+    "run": ("#E6F0FF", "#1F5FBF"), "fail": ("#FDE2E0", "#C62828"), "info": ("#EEF0F2", "#4A5058"),
+}
+
+
+class Selectable:
+    """Drag-select / click-select / right-click for a profile card or row (the page owns the selection)."""
+
+    def _make_result_row(self):
+        self.res = QWidget()
+        rh = QHBoxLayout(self.res)
+        rh.setContentsMargins(0, 0, 0, 0)
+        rh.setSpacing(8)
+        self.badge = QLabel()
+        self.badge_sub = QLabel()
+        self.badge_sub.setStyleSheet("font-size:13px;color:#5B616B")
+        rh.addWidget(self.badge)
+        rh.addWidget(self.badge_sub, 1)
+        self.res.setVisible(False)
+        return self.res
+
+    def show_result(self):
+        r = self.page.results.get(self.p.directory)
+        if not r:
+            self.res.setVisible(False)
+            return
+        kind, text, sub = r
+        bg, fg = BADGE.get(kind, BADGE["info"])
+        self.badge.setText(text)
+        self.badge.setAccessibleName(f"Result {self.p.name}: {text}")
+        self.badge.setStyleSheet(f"background:{bg};color:{fg};border-radius:7px;padding:3px 9px;font-size:14px;font-weight:600")
+        self.badge_sub.setText(sub)
+        self.badge_sub.setAccessibleName(f"Result detail {self.p.name}: {sub}")
+        self.res.setVisible(True)
+
+    def selected(self):
+        return self.p.directory in self.page.selected
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.page.drag_press(e.globalPosition().toPoint(), self, e.modifiers())
+        QFrame.mousePressEvent(self, e)
+
+    def mouseMoveEvent(self, e):
+        self.page.drag_move(e.globalPosition().toPoint())
+        QFrame.mouseMoveEvent(self, e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.page.drag_release(e.globalPosition().toPoint())
+        QFrame.mouseReleaseEvent(self, e)
+
+    def contextMenuEvent(self, e):
+        if not self.selected():
+            self.page.set_selection({self.p.directory})
+        self.page.selection_menu(e.globalPos())
+
+
+class ProfileCard(Selectable, QFrame):
     def __init__(self, page, p):
         super().__init__()
         self.page, self.p = page, p
@@ -49,6 +110,7 @@ class ProfileCard(QFrame):
         v.addLayout(top)
         self.status = StatusLabel("Idle")
         v.addWidget(self.status)
+        v.addWidget(self._make_result_row())
         self.preview = Preview()
         v.addWidget(self.preview, 1)
         self.action = button("Focus window", "outline", "window")
@@ -61,7 +123,8 @@ class ProfileCard(QFrame):
         s = c.status(self.p)
         self.name.setText(self.p.name)
         self.status.set_status(s)
-        self.setObjectName("cardAlert" if s == "Needs reply" else "card")
+        self.setObjectName("cardSel" if self.selected() else ("cardAlert" if s == "Needs reply" else "card"))
+        self.show_result()
         self.style().unpolish(self)
         self.style().polish(self)
         open_ = bool(c.windows.get(self.p.directory))
@@ -99,8 +162,8 @@ class ProfileCard(QFrame):
         m.addAction("Open Hark", lambda: c.open_in(self.p, "https://hark.com/chat"))
         m.addSeparator()
         m.addAction("Rename…", self.rename)
-        if not self.p.managed:
-            m.addAction("Install Hark bridge…", lambda: self.page.install_bridge.emit(self.p.directory))
+        m.addAction("Check Limit", lambda: self.page.run_check([self.p.directory]))
+        m.addAction("Install Hark Bridge", lambda: self.page.run_install([self.p.directory]))
         m.addAction("Hide from list", self.hide_profile)
         m.exec(self.dots.mapToGlobal(self.dots.rect().bottomLeft()))
 
@@ -118,7 +181,7 @@ class ProfileCard(QFrame):
         self.page.rebuild()
 
 
-class ProfileRow(QFrame):
+class ProfileRow(Selectable, QFrame):
     def __init__(self, page, p):
         super().__init__()
         self.page, self.p = page, p
@@ -134,6 +197,7 @@ class ProfileRow(QFrame):
         self.name = label(p.name, size=18, bold=True)
         col.addWidget(self.name)
         col.addWidget(label(p.email or "Not signed in", obj="muted"))
+        col.addWidget(self._make_result_row())
         h.addLayout(col, 2)
         self.status = StatusLabel("Idle")
         h.addWidget(self.status, 1)
@@ -149,6 +213,10 @@ class ProfileRow(QFrame):
         s = c.status(self.p)
         self.name.setText(self.p.name)
         self.status.set_status(s)
+        self.setObjectName("cardSel" if self.selected() else "card")
+        self.show_result()
+        self.style().unpolish(self)
+        self.style().polish(self)
         open_ = bool(c.windows.get(self.p.directory))
         self.action.setText("Focus window" if open_ else "Launch")
         self.action.setIcon(icons.icon("window" if open_ else "play", 18))
@@ -197,6 +265,10 @@ class ClosedRow(QFrame):
         self.name.setText(self.p.name)
 
 
+class _Relay(QObject):
+    result = Signal(str, str, str, str)     # profile dir, kind, text, detail (from worker threads)
+
+
 class ProfilesPage(QWidget):
     install_bridge = Signal(str)
     open_view = Signal(str)   # profile dir -> show its live browser window inside the Manager
@@ -205,6 +277,14 @@ class ProfilesPage(QWidget):
         super().__init__()
         self.ctl = ctl
         self.items = {}
+        self.selected = set()      # profile dirs highlighted (drag / click / right-click)
+        self.results = {}          # profile dir -> (kind, text, detail) shown on its card
+        self._drag = None
+        self._checks = {}          # check id -> profile dir (waiting for the bridge)
+        self._cid = 0
+        self.relay = _Relay()
+        self.relay.result.connect(self.set_result)
+        ctl.limit_result.connect(self.on_limit)
         v = QVBoxLayout(self)
         v.setContentsMargins(24, 22, 24, 10)
         v.setSpacing(18)
@@ -272,6 +352,8 @@ class ProfilesPage(QWidget):
         add.setStyleSheet("font-size:17px; padding: 8px 26px;")
         add.clicked.connect(self.add_profile)
         self.addbtn = add
+        self.sel_label = label("", size=16)
+        self.sel_label.setAccessibleName("Selection count")
         self._bar_narrow = None
         self._layout_bar(False)
         v.addLayout(self.bar)
@@ -282,6 +364,9 @@ class ProfilesPage(QWidget):
         self.grid.setContentsMargins(0, 0, 6, 10)
         self.grid.setSpacing(18)
         self.scroll.setWidget(self.holder)
+        self.holder.installEventFilter(self)       # drag starting on empty space between cards
+        self.band = QRubberBand(QRubberBand.Rectangle, self.holder)
+        self.band.setStyleSheet("QRubberBand{border:2px solid #7BD21A;background:rgba(155,234,44,45);}")
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.viewport().installEventFilter(self)
         v.addWidget(self.scroll, 1)
@@ -372,6 +457,8 @@ class ProfilesPage(QWidget):
         ps = self.visible_profiles()
         self._sig = (self.tab, [p.directory for p in ps])
         self.update_counts()
+        self.selected &= {p.directory for p in ps} if self.tab == "open" else set()
+        self._sel_text()
         if self.tab == "closed":
             return self._build_closed(ps)
         for i, p in enumerate(ps):
@@ -442,7 +529,7 @@ class ProfilesPage(QWidget):
         if narrow == self._bar_narrow:
             return
         self._bar_narrow = narrow
-        for w in (self.search, self.bfilter, self.filter, self.seg, self.addbtn):
+        for w in (self.search, self.bfilter, self.filter, self.seg, self.addbtn, self.sel_label):
             self.bar.removeWidget(w)
         for c in range(6):
             self.bar.setColumnStretch(c, 0)
@@ -451,6 +538,7 @@ class ProfilesPage(QWidget):
             self.bar.addWidget(self.bfilter, 0, 3, 1, 2)
             self.bar.addWidget(self.filter, 1, 0)
             self.bar.addWidget(self.seg, 1, 1)
+            self.bar.addWidget(self.sel_label, 1, 2)
             self.bar.addWidget(self.addbtn, 1, 4)
             self.bar.setColumnStretch(0, 1)
             self.bar.setColumnStretch(2, 1)
@@ -459,6 +547,7 @@ class ProfilesPage(QWidget):
             self.bar.addWidget(self.bfilter, 0, 1)
             self.bar.addWidget(self.filter, 0, 2)
             self.bar.addWidget(self.seg, 0, 3)
+            self.bar.addWidget(self.sel_label, 0, 4)
             self.bar.addWidget(self.addbtn, 0, 5)
             self.bar.setColumnStretch(0, 3)
             self.bar.setColumnStretch(1, 2)
@@ -476,7 +565,178 @@ class ProfilesPage(QWidget):
     def eventFilter(self, obj, e):
         if obj is self.scroll.viewport() and e.type() == QEvent.Resize:
             self._update_cols()
+        if obj is self.holder and self.tab == "open":
+            t = e.type()
+            if t == QEvent.MouseButtonPress and e.button() == Qt.LeftButton:
+                self.drag_press(e.globalPosition().toPoint(), None, e.modifiers())
+                return True
+            if t == QEvent.MouseMove and self._drag:
+                self.drag_move(e.globalPosition().toPoint())
+                return True
+            if t == QEvent.MouseButtonRelease and e.button() == Qt.LeftButton:
+                self.drag_release(e.globalPosition().toPoint())
+                return True
         return super().eventFilter(obj, e)
+
+    # ---------- selection ----------
+    def drag_press(self, gpos, item, mods):
+        ctrl = bool(mods & (Qt.ControlModifier | Qt.ShiftModifier))
+        self._drag = {"o": self.holder.mapFromGlobal(gpos), "item": item, "ctrl": ctrl, "moved": False,
+                      "base": set(self.selected) if ctrl else set()}
+
+    def drag_move(self, gpos):
+        d = self._drag
+        if not d:
+            return
+        pt = self.holder.mapFromGlobal(gpos)
+        if not d["moved"] and (pt - d["o"]).manhattanLength() < 8:
+            return
+        d["moved"] = True
+        r = QRect(d["o"], pt).normalized()
+        self.band.setGeometry(r)
+        self.band.show()
+        self.band.raise_()
+        hit = {k for k, w in self.items.items() if isinstance(w, (ProfileCard, ProfileRow)) and w.geometry().intersects(r)}
+        self.set_selection(d["base"] | hit)
+
+    def drag_release(self, gpos):
+        d, self._drag = self._drag, None
+        self.band.hide()
+        if not d or d["moved"]:
+            return
+        it = d["item"]
+        if it is None:
+            if not d["ctrl"]:
+                self.set_selection(set())
+            return
+        k = it.p.directory
+        if d["ctrl"]:
+            self.set_selection(self.selected ^ {k})
+        else:
+            self.set_selection({k})
+
+    def set_selection(self, dirs):
+        dirs = {k for k in dirs if k in self.items and isinstance(self.items[k], (ProfileCard, ProfileRow))}
+        if dirs == self.selected:
+            return
+        self.selected = dirs
+        for k, w in self.items.items():
+            if isinstance(w, (ProfileCard, ProfileRow)):
+                w.refresh()
+        self._sel_text()
+
+    def _sel_text(self):
+        n = len(self.selected)
+        self.sel_label.setText(f"{n} selected" if n else "")
+
+    def selection_menu(self, gpos):
+        n = len(self.selected)
+        if not n:
+            return
+        m = QMenu(self)
+        dirs = sorted(self.selected)
+        # close the menu first, then run (also when the item is pressed through accessibility)
+        m.addAction("Check Limit", lambda: (m.close(), QTimer.singleShot(0, lambda: self.run_check(dirs))))
+        m.addAction("Install Hark Bridge", lambda: (m.close(), QTimer.singleShot(0, lambda: self.run_install(dirs))))
+        m.exec(gpos)
+
+    def set_result(self, k, kind, text, sub):
+        self.results[k] = (kind, text, sub)
+        w = self.items.get(k)
+        if w is not None and hasattr(w, "show_result"):
+            w.show_result()
+
+    # ---------- Check Limit (read only) ----------
+    def run_check(self, dirs):
+        for k in dirs:
+            p = self.ctl.profile(k)
+            if not p:
+                continue
+            if not self.ctl.windows.get(k):
+                self.set_result(k, "info", "Closed", "Launch karke check karein")
+                continue
+            self._cid += 1
+            cid = self._cid
+            self._checks[cid] = k
+            self.set_result(k, "run", "Checking…", "Hark tab dekh raha hoon")
+            self.ctl.check_limit(p, cid)
+            QTimer.singleShot(30000, lambda cid=cid, k=k: self._check_timeout(cid, k))
+
+    def _check_timeout(self, cid, k):
+        if self._checks.pop(cid, None):
+            p = self.ctl.profile(k)
+            live = p and self.ctl.bridge_live(p)
+            self.set_result(k, "fail", "No answer", "Hark tab khol kar dobara check karein" if live else "Hark Bridge connected nahi")
+
+    def on_limit(self, k, res):
+        cid = res.get("id")
+        if cid in self._checks:
+            self._checks.pop(cid, None)
+        tabs = [t for t in (res.get("tabs") or []) if t and not t.get("err")]
+        lim = [t for t in tabs if t.get("reached")]
+        if lim:
+            reset = next((t["reset"] for t in lim if t.get("reset")), "")
+            if reset[:5].lower() in ("today", "tomor"):
+                reset = reset[0].lower() + reset[1:]
+            out = ("limit", "Limit reached", f"Resets {reset}" if reset else "Reset time nahi dikha")
+        elif any(t.get("loaded") and t.get("active") for t in tabs):
+            out = ("ready", "Ready to work", "")
+        elif any(t.get("signin") for t in tabs):
+            out = ("fail", "Not signed in", "Hark sign-in page khula hai")
+        elif any(t.get("loaded") for t in tabs):
+            out = ("fail", "Not ready", "Message box active nahi")
+        elif not tabs:
+            out = ("fail", "Not ready", "Hark tab nahi mila")
+        else:
+            out = ("fail", "Not ready", "Hark chat load nahi hui")
+        config.log(f"check limit {k}: {out[1]} {out[2]} tabs={[(t.get('url','')[:40], t.get('reached'), t.get('loaded'), t.get('active')) for t in tabs]}")
+        self.set_result(k, *out)
+
+    # ---------- Install Hark Bridge ----------
+    def run_install(self, dirs):
+        ps = [p for p in (self.ctl.profile(k) for k in dirs) if p]
+        if not ps:
+            return
+        for p in ps:
+            self.set_result(p.directory, "info", "Queued", "Bridge install")
+        threading.Thread(target=self._install_all, args=(ps,), daemon=True).start()
+
+    def _install_all(self, ps):
+        from .. import installer
+        emit = self.relay.result.emit
+        for p in ps:
+            k = p.directory
+            try:
+                running = bool(self.ctl.windows.get(k))
+                emit(k, "run", "Checking…", "Bridge dhoond raha hoon")
+                if self.ctl.bridge_live(p) or chrome_mod.bridge_installed(p, running):
+                    config.log(f"bridge install {k}: already installed, skipped")
+                    emit(k, "ok", "Already installed", "Skip kiya")
+                    continue
+                ext = config.ensure_profile_extension(p.data_dir, p.tag) if p.managed else config.ensure_extension()
+                t0 = time.time()
+                emit(k, "run", "Installing…", "Extensions · Load unpacked")
+                ok, msg = installer.install_bridge(p, ext, self.ctl.exe_for(p) if p.managed else None)
+                if not ok:
+                    emit(k, "fail", "Install failed", msg)
+                    continue
+                emit(k, "run", "Verifying…", "Bridge report ka intezar")
+                verified = ""
+                end = time.time() + 40
+                while time.time() < end and not verified:
+                    st = self.ctl.state.get(k)
+                    if st and st["t"] > t0:
+                        verified = "bridge connected"
+                    elif chrome_mod.bridge_installed(p, True):
+                        verified = "profile mein mil gaya"
+                    else:
+                        time.sleep(1)
+                config.log(f"bridge install {k}: {msg}; verify={verified or 'FAILED'}")
+                emit(k, "ok" if verified else "fail", "Bridge installed" if verified else "Not verified",
+                     f"Verified: {verified}" if verified else "Bridge ne report nahi kiya")
+            except Exception as e:
+                config.log(f"bridge install {k}: {e}")
+                emit(k, "fail", "Install failed", str(e)[:60])
 
     def showEvent(self, e):
         super().showEvent(e)
