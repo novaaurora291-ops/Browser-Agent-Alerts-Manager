@@ -2,7 +2,7 @@
 import threading
 import os
 import time
-EXT_VERSION = "1.0.9"
+EXT_VERSION = "1.0.14"
 ALERT_GRACE = 15  # an alert Hark no longer shows as waiting (live DOM) is cleared after this many seconds
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -22,6 +22,40 @@ def conv_key(url):
     if m:
         return "project:" + m.group(1).lower()
     return "chat"
+
+
+HOSTED_FILE = os.path.join(config.APPDATA, "hosted.json")
+
+
+class Hosted(dict):
+    """Windows hosted inside the Manager, mirrored to disk: if the Manager dies while hosting them, Windows closes
+    those browser windows with it, and the next start reopens them (with their tabs) through each profile's bridge."""
+    def __init__(self, ctl):
+        super().__init__()
+        self.ctl = ctl
+
+    def _save(self):
+        import json
+        try:
+            os.makedirs(os.path.dirname(HOSTED_FILE), exist_ok=True)
+            with open(HOSTED_FILE, "w", encoding="utf-8") as f:
+                json.dump({"dirs": list(self.keys()), "tabs": {d: self.ctl.tab_urls(d) for d in self.keys()},
+                           "t": time.time()}, f)
+        except Exception as e:
+            log(f"hosted save: {e}")
+
+    def __setitem__(self, k, v):
+        super().__setitem__(k, v)
+        self._save()
+
+    def __delitem__(self, k):
+        super().__delitem__(k)
+        self._save()
+
+    def pop(self, k, *d):
+        r = super().pop(k, *d)
+        self._save()
+        return r
 
 
 class Controller(QObject):
@@ -44,7 +78,8 @@ class Controller(QObject):
         self.by_tag = {}
         self.state = {}       # profile_dir -> {"t":..., "tabs":[...], "hark":{tabId: state}}
         self.windows = {}     # profile_dir -> [(hwnd,title,aumid,minimized)]
-        self.embedded = {}    # profile_dir -> hwnd of its browser window currently hosted inside the Manager
+        self.embedded = Hosted(self)  # profile_dir -> hwnd of its browser window currently hosted inside the Manager
+
         self.previews = {}    # profile_dir -> png bytes
         self.tg_ok = False
         self.tg_msg = "Telegram not set up"
@@ -58,6 +93,9 @@ class Controller(QObject):
 
         self.t_bridge = QTimer(self, timeout=self.drain_bridge, interval=400)
         self.t_bridge.start()
+        QTimer.singleShot(1500, self.recover_hosted)
+        self.t_hosted = QTimer(self, interval=10000, timeout=lambda: self.embedded and self.embedded._save())
+        self.t_hosted.start()
         self.t_windows = QTimer(self, timeout=self.refresh_windows, interval=1500)
         self.t_windows.start()
         self.t_prev = QTimer(self, timeout=self.refresh_previews)
@@ -184,6 +222,56 @@ class Controller(QObject):
     def bridge_ver(self, p):
         return (self.state.get(p.directory) or {}).get("ver", "")
 
+    def vpn(self, p):
+        """('on', 'US') / ('off', '') / ('unknown', why) - read by this profile's own bridge, never guessed."""
+        st = self.state.get(p.directory) or {}
+        if not self.windows.get(p.directory) and p.directory not in self.embedded:
+            return "unknown", "browser band hai"
+        if not st or time.time() - st.get("vpn_t", 0) > 90:
+            return "unknown", "bridge se VPN status nahi mila"
+        v = st.get("vpn") or {}
+        if v.get("state") == "on" and v.get("country"):
+            return "on", v["country"]
+        if v.get("state") == "off":
+            return "off", ""
+        return "unknown", v.get("why") or "verify nahi hua"
+
+    def tab_urls(self, d):
+        """URLs of the open tabs in this profile (from its bridge), Hark tabs first; the Manager's own pages left out."""
+        tabs = (self.state.get(d) or {}).get("tabs") or []
+        urls = [t.get("url", "") for t in tabs if (t.get("url") or "").startswith("http") and "127.0.0.1" not in t.get("url", "")]
+        urls = sorted(dict.fromkeys(urls), key=lambda u: 0 if "hark.com" in u else 1)
+        return urls[:20]
+
+    def recover_hosted(self):
+        import json
+        try:
+            with open(HOSTED_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        dirs = [d for d in data.get("dirs", []) if self.profile(d)]
+        if not dirs:
+            return
+        # Windows destroys a browser window together with the app hosting it, so the browser's own
+        # "recently closed" list does not have it: open it again with the tabs it had (saved while hosted).
+        tabs = data.get("tabs") or {}
+        log(f"last run ended while hosting {len(dirs)} browser window(s): reopening them with their tabs")
+        self.embedded._save()
+        self.refresh_windows()
+        for d in dirs:
+            p = self.profile(d)
+            urls = tabs.get(d) or ["https://hark.com/chat"]
+            log(f"restore {d}: {len(urls)} tab(s)")
+            if p.managed:
+                self.open_in(p, urls[0], new_window=bool(self.windows.get(d)), extra=urls[1:])
+            else:
+                chrome.launch(p.directory, urls[0], new_window=bool(self.windows.get(d)), more_urls=urls[1:])
+        QTimer.singleShot(2500, self.refresh_windows)
+
+    def vpn_check(self, p):
+        self.bridge.queue_command(self.bridge_key(p), {"type": "vpn_check"})
+
     def bridge_live(self, p):
         st = self.state.get(p.directory)
         return bool(st and time.time() - st["t"] < STALE)
@@ -278,6 +366,16 @@ class Controller(QObject):
         st = self.state.setdefault(p.directory, {"t": 0, "tabs": [], "hark": {}, "email": email})
         st["tag"] = tag if not p.managed else st.get("tag", "")
         st["ver"] = rep.get("ver") or ""
+        if "vpn" in rep:
+            old = (st.get("vpn") or {}).get("state"), (st.get("vpn") or {}).get("country")
+            st["vpn"] = rep["vpn"] or {}
+            st["vpn_t"] = rep["_t"]
+            if old != (st["vpn"].get("state"), st["vpn"].get("country")):
+                log(f"vpn {p.directory}: {st['vpn'].get('state')} {st['vpn'].get('country', '')} ({st['vpn'].get('lvl', '')}/{st['vpn'].get('mode', '')})")
+                QTimer.singleShot(0, self.changed.emit)
+        if rep.get("vpn_only"):
+            st["t"] = rep["_t"]
+            return False
         if rep.get("limit_result") is not None:      # answer to Check Limit: not a tab/state report
             st["t"] = rep["_t"]
             st["checking"] = 0

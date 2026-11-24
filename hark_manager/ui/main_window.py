@@ -148,6 +148,8 @@ class MainWindow(QMainWindow):
         self.right = NeedsReplyPanel(ctl)
         h.addWidget(self.right)
 
+        self.mv = None
+        self.profiles.open_multiview.connect(self.open_multiview)
         self.profiles.install_bridge.connect(self.install_bridge)
         self.profiles.open_view.connect(lambda d: ctl.view_profile(ctl.profile(d)) if ctl.profile(d) else None)
         ctl.view_request.connect(self.show_view)
@@ -191,7 +193,27 @@ class MainWindow(QMainWindow):
             self.ctl.settings["last_view"] = i
             self.ctl.settings.save()
 
+    def open_multiview(self):
+        if self.mv is None:
+            from .multiview import MultiView
+            self.mv = MultiView(self.ctl, self._release_main)
+            QApplication.instance().aboutToQuit.connect(self.mv.release_all)
+        self.mv.open()
+
+    def _release_main(self, directory):
+        """The Multi-View takes a profile the single live view is showing: hand it over."""
+        if self.stack.currentIndex() == 3 and self.view.dir == directory:
+            self.go(0)
+
     def show_view(self, directory, prefer=""):
+        if self.mv is not None and self.mv.isVisible():
+            for pane in self.mv.panes:
+                if pane.dir == directory and pane.hwnd:
+                    # already live in the Multi-View: bring that pane up instead of moving the window
+                    self.mv.open()
+                    if self.mv.expanded is not pane:
+                        self.mv.toggle_expand(pane)
+                    return
         if not self.isVisible() or self.isMinimized():
             self.show_normal()
         self.go(3)
@@ -258,9 +280,9 @@ class MainWindow(QMainWindow):
             self.hide()
             self.tray.showMessage(APP_TITLE, "Tray mein chal raha hai — alerts aate rahenge.", icons.icon("logo", 32), 3000)
             return
-        import traceback
-        log("main window closing -> quit: " + " | ".join(l.strip() for l in traceback.format_stack(limit=6)))
         self.quitting = True
+        if self.mv is not None and self.mv.isVisible():
+            self.mv.close()      # every hosted browser window back to the desktop first
         self.tray.hide()
         self.ctl.bridge.stop()
         e.accept()

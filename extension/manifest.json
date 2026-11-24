@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Hark Browser Manager Bridge",
-  "version": "1.0.9",
+  "version": "1.0.14",
   "description": "Tells Hark Browser Manager (on this PC) when a Hark agent is waiting for your reply, and lets it open the right Hark tab.",
   "permissions": [
     "tabs",
@@ -9,11 +9,16 @@
     "identity.email",
     "storage",
     "scripting",
-    "alarms"
+    "alarms",
+    "proxy"
   ],
   "host_permissions": [
     "https://hark.com/*",
-    "http://127.0.0.1:47823/*"
+    "http://127.0.0.1:47823/*",
+    "https://api.country.is/*",
+    "https://ipinfo.io/*",
+    "https://ipapi.co/*",
+    "https://ipwho.is/*"
   ],
   "background": {
     "service_worker": "sw.js"

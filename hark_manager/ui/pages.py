@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, Q
                                QSizePolicy, QApplication, QFileDialog, QRubberBand)
 
 from . import icons
-from .widgets import card, label, button, StatusLabel, Toggle, SearchBox, Preview, IconLabel, Dot
+from .widgets import card, label, button, StatusLabel, Toggle, SearchBox, Preview, IconLabel, Dot, VpnBadge
 from .style import ORANGE, GREEN, GRAY, LIME
 from .. import config, notify
 from ..core import EXT_VERSION as EXT_VER
@@ -119,6 +119,8 @@ class ProfileCard(Selectable, QFrame):
         self.name = label(p.name, size=21, bold=True)
         self.name.setToolTip(f"{p.browser_name} • {p.email or 'not signed in'} • {p.data_dir if p.managed else p.directory}")
         top.addWidget(self.name, 1)
+        self.vpn = VpnBadge(13)
+        top.addWidget(self.vpn)
         self.dots = QPushButton("•••")
         self.dots.setObjectName("dots")
         self.dots.setCursor(Qt.PointingHandCursor)
@@ -140,6 +142,7 @@ class ProfileCard(Selectable, QFrame):
         s = c.status(self.p)
         self.name.setText(self.p.name)
         self.status.set_status(s)
+        self.vpn.set_state(*c.vpn(self.p), who=self.p.name)
         self.setObjectName("cardSel" if self.selected() else ("cardAlert" if s == "Needs reply" else "card"))
         self.show_result()
         self._a11y()
@@ -231,6 +234,7 @@ class ProfileRow(Selectable, QFrame):
         s = c.status(self.p)
         self.name.setText(self.p.name)
         self.status.set_status(s)
+        self.vpn.set_state(*c.vpn(self.p), who=self.p.name)
         self.setObjectName("cardSel" if self.selected() else "card")
         self.show_result()
         self._a11y()
@@ -291,6 +295,7 @@ class _Relay(QObject):
 class ProfilesPage(QWidget):
     install_bridge = Signal(str)
     open_view = Signal(str)   # profile dir -> show its live browser window inside the Manager
+    open_multiview = Signal()
 
     def __init__(self, ctl):
         super().__init__()
@@ -371,6 +376,13 @@ class ProfilesPage(QWidget):
         add.setStyleSheet("font-size:17px; padding: 8px 26px;")
         add.clicked.connect(self.add_profile)
         self.addbtn = add
+        mv = button("  Live Multi-View", "outline", "tile", 20)
+        mv.setMinimumHeight(46)
+        mv.setMinimumWidth(205)
+        mv.setStyleSheet("font-size:16px; padding: 8px 18px;")
+        mv.setToolTip("Sab open profiles ki live Hark chats ek alag window mein")
+        mv.clicked.connect(self.open_multiview.emit)
+        self.mvbtn = mv
         self.sel_label = label("", size=16)
         self.sel_label.setAccessibleName("Selection count")
         self._bar_narrow = None
@@ -399,6 +411,7 @@ class ProfilesPage(QWidget):
         (self.t_open if t == "open" else self.t_closed).setChecked(True)
         self.filter.setVisible(t == "open")
         self.seg.setVisible(t == "open")
+        self.mvbtn.setVisible(t == "open")
         self.rebuild()
 
     def is_open(self, p):
@@ -548,9 +561,9 @@ class ProfilesPage(QWidget):
         if narrow == self._bar_narrow:
             return
         self._bar_narrow = narrow
-        for w in (self.search, self.bfilter, self.filter, self.seg, self.addbtn, self.sel_label):
+        for w in (self.search, self.bfilter, self.filter, self.seg, self.addbtn, self.sel_label, self.mvbtn):
             self.bar.removeWidget(w)
-        for c in range(6):
+        for c in range(7):
             self.bar.setColumnStretch(c, 0)
         if narrow:  # two rows: search + browsers, then status + view + add
             self.bar.addWidget(self.search, 0, 0, 1, 3)
@@ -558,6 +571,7 @@ class ProfilesPage(QWidget):
             self.bar.addWidget(self.filter, 1, 0)
             self.bar.addWidget(self.seg, 1, 1)
             self.bar.addWidget(self.sel_label, 1, 2)
+            self.bar.addWidget(self.mvbtn, 1, 3)
             self.bar.addWidget(self.addbtn, 1, 4)
             self.bar.setColumnStretch(0, 1)
             self.bar.setColumnStretch(2, 1)
@@ -567,14 +581,15 @@ class ProfilesPage(QWidget):
             self.bar.addWidget(self.filter, 0, 2)
             self.bar.addWidget(self.seg, 0, 3)
             self.bar.addWidget(self.sel_label, 0, 4)
-            self.bar.addWidget(self.addbtn, 0, 5)
+            self.bar.addWidget(self.mvbtn, 0, 5)
+            self.bar.addWidget(self.addbtn, 0, 6)
             self.bar.setColumnStretch(0, 3)
             self.bar.setColumnStretch(1, 2)
             self.bar.setColumnStretch(2, 2)
             self.bar.setColumnStretch(4, 1)
 
     def _update_cols(self):
-        self._layout_bar(self.width() < 900)
+        self._layout_bar(self.width() < 1060)
         cols = self._calc_cols()
         if cols != self.cols:
             self.cols = cols

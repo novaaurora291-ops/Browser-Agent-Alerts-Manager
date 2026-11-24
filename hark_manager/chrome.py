@@ -199,12 +199,13 @@ def managed_windows(dirs):
     return out
 
 
-def launch(profile_dir, url=None, new_window=False):
+def launch(profile_dir, url=None, new_window=False, more_urls=None):
     args = [chrome_exe(), f"--profile-directory={profile_dir}"]
     if new_window:
         args.append("--new-window")
     if url:
         args.append(url)
+    args += list(more_urls or [])
     DETACHED = 0x00000008 | 0x00000200
     subprocess.Popen(args, creationflags=DETACHED, close_fds=True)
 
@@ -310,12 +311,15 @@ def capture(hwnd, max_w=520, max_h=330):
         ok = user32.PrintWindow(hwnd, mem.GetSafeHdc(), 2)
         info = bmp.GetInfo()
         data = bmp.GetBitmapBits(True)
-        img = Image.frombuffer("RGB", (info["bmWidth"], info["bmHeight"]), data, "raw", "BGRX", 0, 1)
+        bw, bh = info["bmWidth"], info["bmHeight"]
+        # a bitmap smaller than expected (window resized / maximised meanwhile) used to be read past its end
+        # (frombuffer does not check the size): copy with frombytes only when the size is exactly right
+        img = Image.frombytes("RGB", (bw, bh), data, "raw", "BGRX", 0, 1) if bw > 0 and bh > 0 and len(data) == bw * bh * 4 else None
         win32gui.DeleteObject(bmp.GetHandle())
         mem.DeleteDC()
         src.DeleteDC()
         win32gui.ReleaseDC(hwnd, hdc)
-        if not ok:
+        if not ok or img is None:
             return None
         # trim the 7-8px invisible resize borders Windows 10/11 add around the window
         img = img.crop((8, 0, max(9, w - 8), max(9, h - 8)))
@@ -357,12 +361,13 @@ def embed(hwnd, parent):
     (same process, same profile, same signed-in session); we only host its window. Returns state for unembed."""
     import win32gui
     import win32con
+    place = win32gui.GetWindowPlacement(hwnd)     # (flags, showCmd, minpos, maxpos, normal rect): restored on unembed
     if win32gui.IsIconic(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-    elif win32gui.GetWindowPlacement(hwnd)[1] == win32con.SW_SHOWMAXIMIZED:
+    elif place[1] == win32con.SW_SHOWMAXIMIZED:
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
     st = {"style": user32.GetWindowLongPtrW(hwnd, GWL_STYLE), "ex": user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
-          "rect": win32gui.GetWindowRect(hwnd)}
+          "rect": win32gui.GetWindowRect(hwnd), "place": place}
     style = (st["style"] & ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)) | WS_CHILD
     user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style)
     user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, st["ex"] & ~WS_EX_APPWINDOW)
@@ -391,6 +396,13 @@ def unembed(hwnd, st):
         user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, st["ex"])
         l, t, r, b = st["rect"]
         win32gui.SetWindowPos(hwnd, 0, l, t, r - l, b - t, win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED | win32con.SWP_SHOWWINDOW)
+        pl = st.get("place")
+        if pl:
+            # back to the size it had and to maximised / minimised when it was
+            cmd = pl[1] if pl[1] in (win32con.SW_SHOWMAXIMIZED, win32con.SW_SHOWMINIMIZED) else win32con.SW_SHOWNORMAL
+            if cmd == win32con.SW_SHOWMINIMIZED:
+                cmd = win32con.SW_SHOWMINNOACTIVE
+            win32gui.SetWindowPlacement(hwnd, (pl[0], cmd, pl[2], pl[3], pl[4]))
     except Exception as e:
         log(f"unembed {hwnd}: {e}")
 
@@ -472,3 +484,11 @@ def bridge_installed(p, running):
             return _proc_has_bridge_flag(p)
         return os.path.isfile(os.path.join(p.data_dir, "_hbm_bridge", "manifest.json"))
     return False
+
+
+def reparent(hwnd, parent):
+    """Move an already hosted browser window from one of our host widgets to another (no style change)."""
+    import win32gui
+    import win32con
+    user32.SetParent(hwnd, parent)
+    win32gui.SetWindowPos(hwnd, 0, 0, 0, 0, 0, win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_SHOWWINDOW)

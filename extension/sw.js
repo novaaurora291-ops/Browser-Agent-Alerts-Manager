@@ -97,6 +97,19 @@ async function runCommands(cmds) {
         await chrome.windows.update(w.id, { focused: true, state: "normal" });
       } else if (c.type === "check_limit") {
         await checkLimit(c);
+      } else if (c.type === "show_hark") {
+        // the Manager's Multi-View pane hosts this profile's window: put its Hark chat tab in front (no window focus)
+        const tabs = await chrome.tabs.query({ url: "https://hark.com/*" });
+        const t = tabs.find(x => !/sign-in|login/.test(x.url || "")) || tabs[0];
+        if (t) await chrome.tabs.update(t.id, { active: true });
+        else {
+          const w = await chrome.windows.getLastFocused().catch(() => null);
+          await chrome.tabs.create({ url: "https://hark.com/chat", active: true, windowId: w ? w.id : undefined });
+        }
+      } else if (c.type === "vpn_check") {
+        vpnCache.at = 0;
+        await post("/report", { email: await getEmail(), tag: await getTag(), ext_id: chrome.runtime.id, ver: chrome.runtime.getManifest().version,
+                                tabs: [], windows: [], hark: null, vpn_only: true, vpn: await vpnState(true) });
       } else if (c.type === "reload_ext") {
         chrome.runtime.reload();
       } else if (c.type === "reload_hark") {
@@ -117,6 +130,36 @@ async function runCommands(cmds) {
     } catch (e) { console.warn("cmd failed", c, e); }
   }
 }
+// VPN status of THIS profile, read-only: who controls the proxy (Browsec sets it through chrome.proxy) and,
+// when a VPN extension holds it, the country of the public IP this profile's traffic actually leaves from.
+const IPS = [["https://api.country.is/", "country"], ["https://ipinfo.io/json", "country"], ["https://ipwho.is/", "country_code"], ["https://ipapi.co/json/", "country_code"]];
+let vpnCache = { key: "", country: "", at: 0 };
+async function ipCountry() {
+  for (const [u, k] of IPS) {
+    try {
+      const ac = new AbortController(); const tm = setTimeout(() => ac.abort(), 6000);
+      const r = await fetch(u, { cache: "no-store", signal: ac.signal }); clearTimeout(tm);
+      if (!r.ok) continue;
+      const c = ((await r.json())[k] || "").toUpperCase();
+      if (/^[A-Z]{2}$/.test(c)) return c;
+    } catch (e) {}
+  }
+  return "";
+}
+async function vpnState(force) {
+  let ps;
+  try { ps = await chrome.proxy.settings.get({ incognito: false }); } catch (e) { return { state: "unknown", why: "proxy api" }; }
+  const lvl = ps.levelOfControl || "", mode = (ps.value || {}).mode || "";
+  const held = lvl === "controlled_by_other_extensions";
+  if (!held || !(mode === "pac_script" || mode === "fixed_servers")) { vpnCache = { key: "", country: "", at: 0 }; return { state: "off", lvl, mode, at: Date.now() }; }
+  const key = lvl + "|" + mode;
+  if (force || vpnCache.key !== key || Date.now() - vpnCache.at > 180000 || !vpnCache.country) {
+    vpnCache = { key, country: await ipCountry(), at: Date.now() };
+  }
+  return vpnCache.country ? { state: "on", country: vpnCache.country, lvl, mode, at: vpnCache.at }
+                          : { state: "unknown", why: "ip check failed", lvl, mode, at: vpnCache.at };
+}
+try { chrome.proxy.settings.onChange.addListener(() => { vpnCache.at = 0; report().catch(() => {}); }); } catch (e) {}
 async function report(extra) {
   const tabs = await chrome.tabs.query({});
   const wins = await chrome.windows.getAll();
@@ -127,7 +170,8 @@ async function report(extra) {
     ver: chrome.runtime.getManifest().version,
     windows: wins.map(w => ({ id: w.id, focused: w.focused, state: w.state })),
     tabs: tabs.map(t => ({ id: t.id, windowId: t.windowId, active: t.active, url: t.url || "", title: t.title || "" })),
-    hark: extra || null
+    hark: extra || null,
+    vpn: await vpnState(false).catch(() => ({ state: "unknown", why: "error" }))
   };
   const res = await post("/report", body);
   await runCommands(res.commands);

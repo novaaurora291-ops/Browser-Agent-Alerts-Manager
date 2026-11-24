@@ -198,3 +198,38 @@ class IconLabel(QLabel):
         super().__init__()
         self.setPixmap(icons.pixmap(name, size, color))
         self.setFixedSize(size + 4, size + 4)
+
+
+class VpnBadge(QFrame):
+    """One badge for a profile's VPN, read by its own bridge: 'VPN on · US' (green) / 'VPN off' / 'VPN unknown'."""
+    STYLES = {"on": ("#EAF8D2", "#1F7A1F", "#1F7A1F"), "off": ("#F0F2F4", "#2B3036", "#2B3036"),
+              "unknown": ("#F0F2F4", "#2B3036", "#5B616B")}
+
+    def __init__(self, size=14):
+        super().__init__()
+        self.setObjectName("vpnBadge")
+        h = QHBoxLayout(self)
+        h.setContentsMargins(9, 3, 11, 3)
+        h.setSpacing(5)
+        self.ic = QLabel()
+        self.tx = QLabel()
+        self.sz = size
+        h.addWidget(self.ic)
+        h.addWidget(self.tx)
+        self.state = None
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.set_state("unknown", "")
+
+    def set_state(self, state, info, who=""):
+        text = {"on": f"VPN on · {info}", "off": "VPN off"}.get(state, "VPN unknown")
+        bg, fg, icol = self.STYLES.get(state, self.STYLES["unknown"])
+        if (state, text) != self.state:
+            self.state = (state, text)
+            self.setStyleSheet(f"QFrame#vpnBadge{{background:{bg};border-radius:12px;}}"
+                               f"QLabel{{color:{fg};font-size:{self.sz}px;font-weight:600;background:transparent;}}")
+            self.ic.setPixmap(icons.pixmap("shield", self.sz + 2, icol))
+            self.tx.setText(text)
+        tip = {"on": f"Browsec connected · public IP country {info} (is profile se verify kiya)",
+               "off": "Is profile mein koi VPN proxy on nahi (confirmed)"}.get(state, f"VPN status verify nahi hua: {info}")
+        self.setToolTip(tip)
+        self.setAccessibleName(f"VPN badge {who}: {text}".strip())
