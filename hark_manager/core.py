@@ -2,7 +2,7 @@
 import threading
 import os
 import time
-EXT_VERSION = "1.0.7"
+EXT_VERSION = "1.0.9"
 ALERT_GRACE = 15  # an alert Hark no longer shows as waiting (live DOM) is cleared after this many seconds
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -83,10 +83,15 @@ class Controller(QObject):
         # bridge reports: Chrome profiles are matched by their Google account, managed ones by their own tag
         self.by_email = {p.email.lower(): p for p in ps if p.email}
         self.by_tag = {p.tag: p for p in managed}
+        for p in ps:   # a Chrome profile is paired with its bridge by a tag too (needed when it has no Google account)
+            self.by_tag[chrome.pair_tag(p)] = p
         self.changed.emit()
 
     def bridge_key(self, p):
-        return p.tag if p.managed else (p.email or "").lower()
+        if p.managed:
+            return p.tag
+        st = self.state.get(p.directory) or {}
+        return st.get("tag") or (p.email or "").lower()
 
     def browser_exe(self):
         exe = (self.settings["browser_exe"] or "").strip().strip('"')
@@ -140,9 +145,44 @@ class Controller(QObject):
             return "Closed"
         return "Idle"
 
+    def pair_bridge(self, p):
+        """Tell this profile's bridge which profile it is: open the Manager's local tag page in that profile;
+        the bridge stores the tag, reports, and closes the tab itself."""
+        url = f"http://127.0.0.1:{config.BRIDGE_PORT}/hbm-tag?p={chrome.pair_tag(p) if not p.managed else p.tag}&close=1"
+        log(f"pairing bridge in {p.directory}")
+        self.state.setdefault(p.directory, {"t": 0, "tabs": [], "hark": {}, "email": ""})["checking"] = time.time()
+        if p.managed:
+            self.open_in(p, url)
+        else:
+            chrome.launch(p.directory, url)
+
+    def reload_bridge(self, p):
+        try:
+            config.ensure_profile_extension(p.data_dir, p.tag) if p.managed else config.ensure_extension()
+        except Exception as e:
+            log(f"bridge files update {p.directory}: {e}")
+        st = self.state.setdefault(p.directory, {"t": 0, "tabs": [], "hark": {}, "email": ""})
+        st["reload_asked"] = time.time()
+        self.bridge.queue_command(self.bridge_key(p), {"type": "reload_ext"})
+        self.pair_bridge(p)      # the pairing tab makes the old bridge report now and take the reload
+
     def check_limit(self, p, cid):
         """Ask this profile's bridge for a read-only look at its Hark tab (limit popup / message box)."""
-        self.bridge.queue_command(self.bridge_key(p), {"type": "check_limit", "id": cid})
+        st = self.state.setdefault(p.directory, {"t": 0, "tabs": [], "hark": {}, "email": ""})
+        st["checking"] = time.time()
+        key = self.bridge_key(p)
+        with self.bridge.lock:   # a reload still waiting to be picked up would cut the check short
+            q = self.bridge.commands.get(key) or []
+            self.bridge.commands[key] = [c for c in q if c.get("type") != "reload_ext"]
+        self.bridge.queue_command(key, {"type": "check_limit", "id": cid})
+
+    def bridge_seen(self, p, within=75):
+        """The bridge checked in recently (Hark tab reports or the 30 s heartbeat)."""
+        st = self.state.get(p.directory)
+        return bool(st and time.time() - st["t"] < within)
+
+    def bridge_ver(self, p):
+        return (self.state.get(p.directory) or {}).get("ver", "")
 
     def bridge_live(self, p):
         st = self.state.get(p.directory)
@@ -219,11 +259,15 @@ class Controller(QObject):
     def handle_report(self, rep):
         email = (rep.get("email") or "").lower()
         tag = rep.get("tag") or ""
-        p = self.by_tag.get(tag) if tag else self.by_email.get(email)
-        if not p:
+        p = self.by_tag.get(tag) or (self.by_email.get(email) if email else None)
+        if not p and time.time() - getattr(self, "_reloaded", 0) > 10:
+            self._reloaded = time.time()
             self.reload_profiles()
-            p = self.by_tag.get(tag) if tag else self.by_email.get(email)
+            p = self.by_tag.get(tag) or (self.by_email.get(email) if email else None)
         if not p:
+            if not getattr(self, "_unmapped_logged", None) or time.time() - self._unmapped_logged > 60:
+                self._unmapped_logged = time.time()
+                log(f"bridge report not mapped to a profile (email={email or '-'} tag={tag or '-'}, ext {rep.get('ext_id')})")
             return False
         if p.managed:
             m = self._managed_rec(p.tag)
@@ -232,12 +276,16 @@ class Controller(QObject):
                 self.settings.save()
                 log(f"managed profile {p.tag} bridge connected")
         st = self.state.setdefault(p.directory, {"t": 0, "tabs": [], "hark": {}, "email": email})
+        st["tag"] = tag if not p.managed else st.get("tag", "")
+        st["ver"] = rep.get("ver") or ""
         if rep.get("limit_result") is not None:      # answer to Check Limit: not a tab/state report
             st["t"] = rep["_t"]
+            st["checking"] = 0
             self.limit_result.emit(p.directory, rep["limit_result"])
             return False
         # an older bridge copy is running in this profile: ask it to reload itself (at most once a minute)
-        if rep.get("ver") != EXT_VERSION and time.time() - st.get("reload_asked", 0) > 60:
+        checking = time.time() - st.get("checking", 0) < 60     # never reload the bridge in the middle of a Check Limit
+        if rep.get("limit_result") is None and rep.get("ver") != EXT_VERSION and not checking and time.time() - st.get("reload_asked", 0) > 60:
             st["reload_asked"] = time.time()
             try:   # put the current files where this profile loads the bridge from, then let it reload itself
                 config.ensure_profile_extension(p.data_dir, p.tag) if p.managed else config.ensure_extension()

@@ -12,6 +12,7 @@ from . import icons
 from .widgets import card, label, button, StatusLabel, Toggle, SearchBox, Preview, IconLabel, Dot
 from .style import ORANGE, GREEN, GRAY, LIME
 from .. import config, notify
+from ..core import EXT_VERSION as EXT_VER
 from .. import chrome as chrome_mod
 
 
@@ -69,23 +70,39 @@ class Selectable:
     def selected(self):
         return self.p.directory in self.page.selected
 
+    def _a11y(self):
+        self.setAccessibleName(f"Profile card {self.p.name}" + (" (selected)" if self.selected() else ""))
+
+    # the card takes the press itself: if it fell through to the page, the page would treat it as a
+    # click on empty space (clearing the selection / losing Ctrl+click)
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             self.page.drag_press(e.globalPosition().toPoint(), self, e.modifiers())
+            e.accept()
+            return
+        if e.button() == Qt.RightButton:
+            e.accept()          # right-click never changes a group selection that includes this card
+            return
         QFrame.mousePressEvent(self, e)
 
     def mouseMoveEvent(self, e):
-        self.page.drag_move(e.globalPosition().toPoint())
+        if self.page._drag:
+            self.page.drag_move(e.globalPosition().toPoint())
+            e.accept()
+            return
         QFrame.mouseMoveEvent(self, e)
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton:
             self.page.drag_release(e.globalPosition().toPoint())
+            e.accept()
+            return
         QFrame.mouseReleaseEvent(self, e)
 
     def contextMenuEvent(self, e):
         if not self.selected():
             self.page.set_selection({self.p.directory})
+        e.accept()
         self.page.selection_menu(e.globalPos())
 
 
@@ -125,6 +142,7 @@ class ProfileCard(Selectable, QFrame):
         self.status.set_status(s)
         self.setObjectName("cardSel" if self.selected() else ("cardAlert" if s == "Needs reply" else "card"))
         self.show_result()
+        self._a11y()
         self.style().unpolish(self)
         self.style().polish(self)
         open_ = bool(c.windows.get(self.p.directory))
@@ -215,6 +233,7 @@ class ProfileRow(Selectable, QFrame):
         self.status.set_status(s)
         self.setObjectName("cardSel" if self.selected() else "card")
         self.show_result()
+        self._a11y()
         self.style().unpolish(self)
         self.style().polish(self)
         open_ = bool(c.windows.get(self.p.directory))
@@ -578,6 +597,28 @@ class ProfilesPage(QWidget):
                 return True
         return super().eventFilter(obj, e)
 
+    # a drag may also start in the page margin next to the cards
+    def _in_cards_area(self, e):
+        return self.tab == "open" and e.position().y() >= self.scroll.geometry().top()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self._in_cards_area(e):
+            self.drag_press(e.globalPosition().toPoint(), None, e.modifiers())
+            return e.accept()
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._drag:
+            self.drag_move(e.globalPosition().toPoint())
+            return e.accept()
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self._drag:
+            self.drag_release(e.globalPosition().toPoint())
+            return e.accept()
+        super().mouseReleaseEvent(e)
+
     # ---------- selection ----------
     def drag_press(self, gpos, item, mods):
         ctrl = bool(mods & (Qt.ControlModifier | Qt.ShiftModifier))
@@ -593,7 +634,7 @@ class ProfilesPage(QWidget):
             return
         d["moved"] = True
         r = QRect(d["o"], pt).normalized()
-        self.band.setGeometry(r)
+        self.band.setGeometry(r.intersected(self.holder.rect()))
         self.band.show()
         self.band.raise_()
         hit = {k for k, w in self.items.items() if isinstance(w, (ProfileCard, ProfileRow)) and w.geometry().intersects(r)}
@@ -653,20 +694,65 @@ class ProfilesPage(QWidget):
             if not p:
                 continue
             if not self.ctl.windows.get(k):
-                self.set_result(k, "info", "Closed", "Launch karke check karein")
+                self.set_result(k, "info", "Closed", "Check Limit: Not checked")
                 continue
             self._cid += 1
             cid = self._cid
             self._checks[cid] = k
-            self.set_result(k, "run", "Checking…", "Hark tab dekh raha hoon")
-            self.ctl.check_limit(p, cid)
-            QTimer.singleShot(30000, lambda cid=cid, k=k: self._check_timeout(cid, k))
+            if self.ctl.bridge_seen(p, 10) and self.ctl.bridge_ver(p) == EXT_VER:
+                self._send_check(p, cid)
+                continue
+            # bridge silent: is it installed + enabled here? then pair it with this profile and wait for it
+            if not chrome_mod.bridge_installed(p, True):
+                self._checks.pop(cid, None)
+                self.set_result(k, "fail", "Bridge disconnected", "Bridge install nahi · Check Limit: Not checked")
+                config.log(f"check limit {k}: bridge not installed/enabled")
+                continue
+            self.set_result(k, "run", "Connecting…", "Bridge ko is profile se jod raha hoon")
+            self.ctl.pair_bridge(p)
+            self._wait_live(p, cid, time.time() + 35)
+
+    def _wait_live(self, p, cid, end):
+        if cid not in self._checks:
+            return
+        if self.ctl.bridge_seen(p, 15):
+            ver = self.ctl.bridge_ver(p)
+            if ver and ver != EXT_VER:
+                # an old bridge copy is running: let it reload to the current files first (it reports again on reload)
+                if not getattr(self, "_reload_sent", {}).get(cid):
+                    self._reload_sent = getattr(self, "_reload_sent", {}) | {cid: True}
+                    config.log(f"check limit {p.directory}: bridge {ver} -> reload to {EXT_VER}")
+                    self.set_result(p.directory, "run", "Updating bridge…", f"v{ver} → v{EXT_VER}")
+                    self.ctl.reload_bridge(p)
+                QTimer.singleShot(700, lambda: self._wait_live(p, cid, end))
+                return
+            config.log(f"check limit {p.directory}: bridge connected (v{ver})")
+            return self._send_check(p, cid)
+        if time.time() > end:
+            self._checks.pop(cid, None)
+            config.log(f"check limit {p.directory}: bridge disconnected")
+            return self.set_result(p.directory, "fail", "Bridge disconnected", "Check Limit: Not checked")
+        QTimer.singleShot(700, lambda: self._wait_live(p, cid, end))
+
+    def _send_check(self, p, cid):
+        k = p.directory
+        ver = self.ctl.bridge_ver(p)
+        if ver and tuple(int(x) for x in ver.split(".")[:3]) < (1, 0, 7):
+            # this browser still runs an old bridge copy that has no Check Limit (it updates when the browser restarts)
+            self._checks.pop(cid, None)
+            config.log(f"check limit {k}: bridge {ver} too old")
+            return self.set_result(k, "fail", "Bridge update needed", f"v{ver} · browser restart karein · Not checked")
+        self.set_result(k, "run", "Checking…", "Hark tab dekh raha hoon")
+        self.ctl.check_limit(p, cid)
+        QTimer.singleShot(45000, lambda: self._check_timeout(cid, k))
 
     def _check_timeout(self, cid, k):
         if self._checks.pop(cid, None):
             p = self.ctl.profile(k)
-            live = p and self.ctl.bridge_live(p)
-            self.set_result(k, "fail", "No answer", "Hark tab khol kar dobara check karein" if live else "Hark Bridge connected nahi")
+            if p and self.ctl.bridge_seen(p):
+                self.set_result(k, "fail", "No answer", "Check Limit: Not checked")
+            else:
+                self.set_result(k, "fail", "Bridge disconnected", "Check Limit: Not checked")
 
     def on_limit(self, k, res):
         cid = res.get("id")
@@ -723,14 +809,18 @@ class ProfilesPage(QWidget):
                 emit(k, "run", "Verifying…", "Bridge report ka intezar")
                 verified = ""
                 end = time.time() + 40
+                paired = False
                 while time.time() < end and not verified:
                     st = self.ctl.state.get(k)
                     if st and st["t"] > t0:
                         verified = "bridge connected"
-                    elif chrome_mod.bridge_installed(p, True):
-                        verified = "profile mein mil gaya"
                     else:
+                        if not paired and time.time() - t0 > 6 and chrome_mod.bridge_installed(p, True):
+                            paired = True       # installed but not reporting under this profile yet: pair it
+                            self.ctl.pair_bridge(p)
                         time.sleep(1)
+                if not verified and chrome_mod.bridge_installed(p, True):
+                    verified = "installed (connection pending)"
                 config.log(f"bridge install {k}: {msg}; verify={verified or 'FAILED'}")
                 emit(k, "ok" if verified else "fail", "Bridge installed" if verified else "Not verified",
                      f"Verified: {verified}" if verified else "Bridge ne report nahi kiya")

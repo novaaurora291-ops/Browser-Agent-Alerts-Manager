@@ -403,6 +403,21 @@ def window_title(hwnd):
         return ""
 
 
+def pair_tag(p):
+    import re
+    return "chr_" + re.sub(r"[^A-Za-z0-9_-]", "_", p.directory)
+
+
+def _is_bridge_dir(path):
+    """Any unpacked folder whose manifest is the Hark bridge (repo's extension\\, bridge_extension\\, _hbm_bridge\\)."""
+    import json
+    try:
+        with open(os.path.join(path, "manifest.json"), encoding="utf-8") as f:
+            return json.load(f).get("name") == "Hark Browser Manager Bridge"
+    except Exception:
+        return False
+
+
 def _ext_records(prefs_dir):
     """Bridge extension entries in a profile's Preferences (read only)."""
     import json
@@ -415,9 +430,13 @@ def _ext_records(prefs_dir):
         except Exception:
             continue
         for k, v in st.items():
-            path = (v.get("path") or "").replace("/", "\\").rstrip("\\").lower()
-            if path.endswith("\\_hbm_bridge") or path.endswith("\\bridge_extension"):
-                out.append({"id": k, "location": v.get("location"), "state": v.get("state", 1), "path": path})
+            raw = (v.get("path") or "").replace("/", "\\").rstrip("\\")
+            path = raw.lower()
+            if path.endswith("\\_hbm_bridge") or path.endswith("\\bridge_extension") or (v.get("location") == 4 and _is_bridge_dir(raw)):
+                # newer Chrome drops "state"; disabled shows as disable_reasons
+                dr = v.get("disable_reasons")
+                enabled = v.get("state", 1) == 1 and not (dr if isinstance(dr, int) else (dr or []))
+                out.append({"id": k, "location": v.get("location"), "state": 1 if enabled else 0, "path": path})
     return out
 
 

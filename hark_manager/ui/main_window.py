@@ -258,6 +258,8 @@ class MainWindow(QMainWindow):
             self.hide()
             self.tray.showMessage(APP_TITLE, "Tray mein chal raha hai — alerts aate rahenge.", icons.icon("logo", 32), 3000)
             return
+        import traceback
+        log("main window closing -> quit: " + " | ".join(l.strip() for l in traceback.format_stack(limit=6)))
         self.quitting = True
         self.tray.hide()
         self.ctl.bridge.stop()

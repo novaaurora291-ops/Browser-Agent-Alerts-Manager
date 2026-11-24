@@ -41,10 +41,14 @@ class Bridge:
 
             def do_GET(self):
                 if self.path.startswith("/hbm-tag?"):
-                    # first page of a new managed profile: the bridge extension reads the tag from this URL
-                    d = (b"<!doctype html><meta charset=utf-8><meta http-equiv=refresh content='2;url=https://hark.com/'>"
-                         b"<title>Hark Browser Manager</title><body style='font:18px Segoe UI;padding:40px'>"
-                         b"Hark Browser Manager: profile ready. Opening Hark...</body>")
+                    # first page of a new managed profile (or a pairing tab): the bridge reads the tag from this URL
+                    if "close=1" in self.path:   # pairing: the bridge closes this tab itself
+                        d = (b"<!doctype html><meta charset=utf-8><title>Hark Browser Manager</title>"
+                             b"<body style='font:16px Segoe UI;padding:40px'>Hark Browser Manager: bridge pairing...</body>")
+                    else:
+                        d = (b"<!doctype html><meta charset=utf-8><meta http-equiv=refresh content='2;url=https://hark.com/'>"
+                             b"<title>Hark Browser Manager</title><body style='font:18px Segoe UI;padding:40px'>"
+                             b"Hark Browser Manager: profile ready. Opening Hark...</body>")
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Content-Length", str(len(d)))

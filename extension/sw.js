@@ -18,10 +18,20 @@ async function getTag() {
   try { const r = await chrome.storage.local.get("hbm_tag"); tag = r.hbm_tag || ""; } catch (e) { tag = ""; }
   return tag;
 }
-chrome.tabs.onUpdated.addListener((_id, info, t) => {
+chrome.tabs.onUpdated.addListener((id, info, t) => {
   const u = info.url || (t && t.url) || "";
   const m = u.match(/^http:\/\/127\.0\.0\.1:47823\/hbm-tag\?p=([A-Za-z0-9_-]+)/);
-  if (m && m[1] !== tag) { tag = m[1]; chrome.storage.local.set({ hbm_tag: tag }); report().catch(() => {}); }
+  if (!m) return;
+  // a per-profile tag.json (managed profiles) always wins over a pairing tag
+  getTag().then(cur => {
+    if (m[1] !== cur) {
+      fetch(chrome.runtime.getURL("tag.json")).then(r => r.ok ? r.json() : null).catch(() => null).then(j => {
+        if (j && j.tag) return;
+        tag = m[1]; chrome.storage.local.set({ hbm_tag: tag });
+      }).finally(() => report().catch(() => {}));
+    } else report().catch(() => {});
+    if (/[?&]close=1/.test(u)) setTimeout(() => chrome.tabs.remove(id).catch(() => {}), 300);
+  });
 });
 async function post(path, body) {
   const r = await fetch(APP + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -67,7 +77,9 @@ async function checkLimit(c) {
   await post("/report", body);
 }
 async function runCommands(cmds) {
-  for (const c of cmds || []) {
+  // a reload always runs last so it never cuts another command short
+  cmds = (cmds || []).filter(c => c.type !== "reload_ext").concat((cmds || []).filter(c => c.type === "reload_ext"));
+  for (const c of cmds) {
     try {
       if (c.type === "open_task") {
         const tabs = await chrome.tabs.query({ url: "https://hark.com/*" });
@@ -130,6 +142,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 chrome.tabs.onActivated.addListener(() => report().catch(() => {}));
 chrome.tabs.onRemoved.addListener(() => report().catch(() => {}));
 chrome.runtime.onStartup.addListener(() => report().catch(() => {}));
+// heartbeat: a profile with no Hark tab still checks in (and picks up Manager commands) every 30 s
+try { chrome.alarms.create("hbm-beat", { periodInMinutes: 0.5 }); chrome.alarms.onAlarm.addListener(a => { if (a.name === "hbm-beat") report().catch(() => {}); }); } catch (e) {}
 async function injectExisting() {
   const tabs = await chrome.tabs.query({ url: "https://hark.com/*" });
   for (const t of tabs) {

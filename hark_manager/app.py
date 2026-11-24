@@ -41,4 +41,7 @@ def main():
     else:
         win.show()
     log("started")
-    return app.exec()
+    app.aboutToQuit.connect(lambda: log("about to quit"))
+    rc = app.exec()
+    log(f"exit rc={rc}")
+    return rc
