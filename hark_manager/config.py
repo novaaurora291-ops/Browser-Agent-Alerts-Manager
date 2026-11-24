@@ -60,6 +60,7 @@ DEFAULTS = {
     "hidden_profiles": [],
     "repo_team": None,            # Shared Repo Team (see repo_team.py): repo, base commit, planner + workers
     "settings_version": 2,
+    "theme": "light",             # "light" / "dark": the whole Manager UI (Settings > Theme)
 }
 
 

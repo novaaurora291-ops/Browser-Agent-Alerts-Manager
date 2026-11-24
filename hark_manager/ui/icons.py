@@ -32,7 +32,10 @@ SVG = {
 }
 
 
-def pixmap(name, size=20, color="#111418"):
+def pixmap(name, size=20, color=None):
+    if color is None:
+        from .style import icon_color
+        color = icon_color()            # line icons follow the theme (dark ink on Light, light ink on Dark)
     svg = SVG[name].replace("{s}", S.replace("{c}", color)).replace("{c}", color)
     r = QSvgRenderer(QByteArray(svg.encode()))
     pm = QPixmap(QSize(size * 2, size * 2))
@@ -44,5 +47,5 @@ def pixmap(name, size=20, color="#111418"):
     return pm
 
 
-def icon(name, size=20, color="#111418"):
+def icon(name, size=20, color=None):
     return QIcon(pixmap(name, size, color))

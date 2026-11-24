@@ -34,6 +34,8 @@ def main():
 
     ensure_extension()
     ctl = Controller()
+    from .ui import style
+    style.apply_theme(ctl.settings["theme"] or "light")     # the saved theme, before any window is built
     win = MainWindow(ctl)
     def on_conn():
         c = server.nextPendingConnection()

@@ -168,9 +168,11 @@ class ProfileCard(Selectable, AlertPulse, QFrame):
         if open_:
             self.action.setText("Focus window")
             self.action.setIcon(icons.icon("window", 18))
+            self.action.setProperty("hbm_icon", "window:18")
         else:
             self.action.setText("Launch")
             self.action.setIcon(icons.icon("play", 18))
+            self.action.setProperty("hbm_icon", "play:18")
         show = c.settings["show_previews"]
         mini = open_ and all(w[3] for w in c.windows.get(self.p.directory, []))
         ph = "Closed" if not open_ else ("Minimized" if mini else ("Previews off" if not show else "Loading preview…"))
@@ -272,6 +274,7 @@ class ProfileRow(Selectable, AlertPulse, QFrame):
         open_ = bool(c.windows.get(self.p.directory))
         self.action.setText("Focus window" if open_ else "Launch")
         self.action.setIcon(icons.icon("window" if open_ else "play", 18))
+        self.action.setProperty("hbm_icon", f"{'window' if open_ else 'play'}:18")
         self.prev.set_png(c.previews.get(self.p.directory) if open_ and c.settings["show_previews"] else None, "" if open_ else "")
 
 
@@ -533,6 +536,7 @@ class ProfilesPage(QWidget):
             b.setObjectName("seg")
             b.setCheckable(True)
             b.setIcon(icons.icon(ic, 22))
+            b.setProperty("hbm_icon", f"{ic}:22")
             b.setFixedSize(64, 42)
             b.setCursor(Qt.PointingHandCursor)
             seg.addWidget(b)
@@ -1363,7 +1367,34 @@ class SettingsPage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(24, 22, 24, 18)
         outer.setSpacing(14)
-        outer.addWidget(label("Settings", obj="h1"))
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        head.addWidget(label("Settings", obj="h1"))
+        head.addStretch(1)
+        head.addWidget(label("Theme", size=18))
+        seg = QHBoxLayout()
+        seg.setSpacing(0)
+        self.th_light = QPushButton("\u263C  Light")
+        self.th_dark = QPushButton("\u263E  Dark")
+        tg = QButtonGroup(self)
+        for b, rad in ((self.th_light, "border-top-left-radius:9px;border-bottom-left-radius:9px;"),
+                       (self.th_dark, "border-top-right-radius:9px;border-bottom-right-radius:9px;")):
+            b.setObjectName("seg")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setMinimumSize(104, 40)
+            b.setStyleSheet("font-size:16px;font-weight:600;" + rad)
+            tg.addButton(b)
+            seg.addWidget(b)
+        self.th_light.setAccessibleName("Theme Light")
+        self.th_dark.setAccessibleName("Theme Dark")
+        self.th_light.setToolTip("Light theme (Save changes se save hota hai)")
+        self.th_dark.setToolTip("Dark theme: charcoal, safed text, lime controls (Save changes se save hota hai)")
+        # shown at once across the whole Manager; Save changes keeps it, Cancel goes back to the saved one
+        self.th_light.clicked.connect(lambda: self.preview_theme("light"))
+        self.th_dark.clicked.connect(lambda: self.preview_theme("dark"))
+        head.addLayout(seg)
+        outer.addLayout(head)
         self.banner = QLabel()
         self.banner.setObjectName("banner")
         self.banner.setWordWrap(True)
@@ -1519,8 +1550,22 @@ class SettingsPage(QWidget):
         ctl.telegram_status.connect(self.on_tg)
         self.load()
 
+    def preview_theme(self, name):
+        from . import style
+        self.th_light.setChecked(name == "light")
+        self.th_dark.setChecked(name == "dark")
+        style.apply_theme(name)
+        config.log(f"theme: {name} (shown, not saved yet)")
+
     def load(self):
         s = self.ctl.settings
+        saved = s["theme"] if s["theme"] in ("light", "dark") else "light"
+        self.th_light.setChecked(saved == "light")
+        self.th_dark.setChecked(saved == "dark")
+        from . import style
+        if style.theme() != saved:
+            style.apply_theme(saved)          # Cancel: back to the saved theme
+            config.log(f"theme: back to saved {saved}")
         self.exe.setText(s["browser_exe"] or "")
         self._exe_hint()
         self.refresh_cb.setCurrentText(f"{s['preview_refresh']} seconds")
@@ -1621,7 +1666,9 @@ class SettingsPage(QWidget):
         s["desktop_alerts"] = self.t_desk.isChecked()
         s["open_task_on_click"] = self.t_click.isChecked()
         s["play_sound"] = self.t_sound.isChecked()
+        s["theme"] = "dark" if self.th_dark.isChecked() else "light"
         s.save()
+        config.log(f"theme saved: {s['theme']}")
         self.ctl.reload_profiles()        # Cent path may have changed: only profiles of that Cent are listed
         ok, err = self.ctl.cent_status()
         if not ok:

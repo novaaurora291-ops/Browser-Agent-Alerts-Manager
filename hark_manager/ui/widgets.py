@@ -39,6 +39,7 @@ def button(text, kind="outline", icon_name=None, icon_size=18):
     if icon_name:
         b.setIcon(icons.icon(icon_name, icon_size))
         b.setIconSize(QSize(icon_size, icon_size))
+        b.setProperty("hbm_icon", f"{icon_name}:{icon_size}")    # re-drawn in the theme's ink on a switch
     return b
 
 
@@ -212,10 +213,11 @@ class Toggle(QAbstractButton):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         r = QRectF(2, 3, 62, 28)
+        from .style import is_dark
         on = QColor(LIME)
-        off = QColor("#D5D8DC")
+        off = QColor("#3A3F46" if is_dark() else "#D5D8DC")
         c = QColor(int(off.red() + (on.red() - off.red()) * self._pos), int(off.green() + (on.green() - off.green()) * self._pos), int(off.blue() + (on.blue() - off.blue()) * self._pos))
-        p.setPen(QColor("#C4C8CD") if self._pos < .5 else Qt.NoPen)
+        p.setPen(QColor("#4A515B" if is_dark() else "#C4C8CD") if self._pos < .5 else Qt.NoPen)
         p.setBrush(c)
         p.drawRoundedRect(r, 14, 14)
         x = 5 + self._pos * 32
@@ -228,9 +230,12 @@ class SearchBox(QLineEdit):
     def __init__(self, placeholder):
         super().__init__()
         self.setPlaceholderText(placeholder)
-        self.addAction(icons.icon("search", 20, "#3a3f45"), QLineEdit.LeadingPosition)
+        self._ic = self.addAction(icons.icon("search", 20), QLineEdit.LeadingPosition)
         self.setMinimumHeight(42)
         self.setStyleSheet("font-size:15px; padding-left:4px")
+
+    def on_theme(self):
+        self._ic.setIcon(icons.icon("search", 20))
 
 
 class Preview(QLabel):
@@ -261,29 +266,31 @@ class Preview(QLabel):
         path = QPainterPath()
         path.addRoundedRect(r, 9, 9)
         p.setClipPath(path)
-        p.fillRect(r, QColor("#EEF0F2"))
+        from .style import is_dark
+        dk = is_dark()
+        p.fillRect(r, QColor("#23282E" if dk else "#EEF0F2"))
         if self.pm and not self.pm.isNull():
             s = self.pm.scaled(int(r.width()), int(r.height()), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
             p.drawPixmap(int(r.x()), int(r.y()), s, 0, 0, int(r.width()), int(r.height()))
         else:
             # browser chrome placeholder like the mock-up
-            p.fillRect(QRectF(r.x(), r.y(), r.width(), 26), QColor("#E2E5E8"))
+            p.fillRect(QRectF(r.x(), r.y(), r.width(), 26), QColor("#2F353D" if dk else "#E2E5E8"))
             for i in range(3):
                 p.setBrush(QColor("#9AA0A6"))
                 p.setPen(Qt.NoPen)
                 p.drawEllipse(QRectF(r.x() + 10 + i * 11, r.y() + 9, 7, 7))
             pm = icons.pixmap("browser", 64, "#A9AFB6")
             p.drawPixmap(int(r.center().x() - 32), int(r.center().y() - 26), pm)
-            p.setPen(QColor("#7d838b"))
+            p.setPen(QColor("#A8AFB8" if dk else "#7d838b"))
             p.drawText(QRectF(r.x(), r.center().y() + 40, r.width(), 22), Qt.AlignCenter, self.placeholder)
         p.setClipping(False)
-        p.setPen(QColor(BORDER))
+        p.setPen(QColor("#2F353D" if dk else BORDER))
         p.setBrush(Qt.NoBrush)
         p.drawRoundedRect(r, 9, 9)
 
 
 class IconLabel(QLabel):
-    def __init__(self, name, size=26, color="#111418"):
+    def __init__(self, name, size=26, color=None):
         super().__init__()
         self.setPixmap(icons.pixmap(name, size, color))
         self.setFixedSize(size + 4, size + 4)
@@ -316,9 +323,15 @@ class VpnBadge(QFrame):
             self.state = (state, text)
             self.setStyleSheet(f"QFrame#vpnBadge{{background:{bg};border-radius:12px;}}"
                                f"QLabel{{color:{fg};font-size:{self.sz}px;font-weight:600;background:transparent;}}")
-            self.ic.setPixmap(icons.pixmap("shield", self.sz + 2, icol))
+            from .style import is_dark, adapt_color
+            self.ic.setPixmap(icons.pixmap("shield", self.sz + 2, adapt_color(icol, "text") if is_dark() else icol))
             self.tx.setText(text)
+        self._last = (state, info, who)
         tip = {"on": f"Browsec connected · public IP country {info} (is profile se verify kiya)",
                "off": "Is profile mein koi VPN proxy on nahi (confirmed)"}.get(state, f"VPN status verify nahi hua: {info}")
         self.setToolTip(tip)
         self.setAccessibleName(f"VPN badge {who}: {text}".strip())
+
+    def on_theme(self):
+        self.state = None
+        self.set_state(*getattr(self, "_last", ("unknown", "", "")))

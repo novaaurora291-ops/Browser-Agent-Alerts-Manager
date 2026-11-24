@@ -16,6 +16,7 @@ class NavButton(QPushButton):
         self.setObjectName("nav")
         self.setCheckable(True)
         self.setIcon(icons.icon(ic, 24))
+        self.setProperty("hbm_icon", f"{ic}:24")
         self.setIconSize(QSize(24, 24))
         self.setMinimumHeight(52)
         self.setCursor(Qt.PointingHandCursor)

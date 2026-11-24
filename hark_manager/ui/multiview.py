@@ -213,6 +213,7 @@ class Pane(QFrame):
 
     def set_expanded(self, on):
         self.b_exp.setIcon(icons.icon("collapse" if on else "expand", 20))
+        self.b_exp.setProperty("hbm_icon", f"{'collapse' if on else 'expand'}:20")
         self.b_exp.setToolTip("Collapse" if on else "Expand")
         self.b_exp.setAccessibleName(f"{'Collapse' if on else 'Expand'} {self.name.text()}")
 

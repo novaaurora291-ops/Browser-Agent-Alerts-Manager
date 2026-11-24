@@ -224,6 +224,7 @@ class BrowserView(QWidget):
         self.expanded = not self.expanded
         self.b_exp.setText("  Collapse" if self.expanded else "  Expand")
         self.b_exp.setIcon(icons.icon("collapse" if self.expanded else "expand", 18))
+        self.b_exp.setProperty("hbm_icon", f"{'collapse' if self.expanded else 'expand'}:18")
         self.expand_toggled.emit(self.expanded)
         QTimer.singleShot(50, self.fit)
 
