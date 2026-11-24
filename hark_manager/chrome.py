@@ -54,12 +54,12 @@ class Profile:
         return self.alias or self.chrome_name or self.directory
 
 
-# ---------------- managed profiles (own --user-data-dir, any Chromium browser such as Cent Browser) ----------------
+# ---------------- managed profiles (own --user-data-dir, Cent Browser only) ----------------
 @__import__("functools").lru_cache(maxsize=64)
 def browser_name(exe):
     """Product name of a browser exe (e.g. 'Cent Browser'), from its version info; falls back to the file name."""
     if not exe:
-        return "Google Chrome"
+        return ""
     try:
         import win32api
         lang, cp = win32api.GetFileVersionInfo(exe, "\\VarFileInfo\\Translation")[0]
@@ -98,14 +98,20 @@ def managed_email(data_dir):
         return ""
 
 
+def is_cent_process_exe(pexe):
+    """A process exe (full path) is the configured Cent chrome.exe. Any other chrome.exe (personal Google Chrome)
+    never counts."""
+    return bool(CENT_EXE) and norm_path(pexe) == CENT_EXE
+
+
 def _profile_running(data_dir):
-    """True while any browser process runs with this --user-data-dir (it would overwrite the name on exit)."""
+    """True while the configured Cent exe runs with this --user-data-dir (it would overwrite the name on exit)."""
     want = norm_dir(data_dir)
     try:
         import psutil
-        for pr in psutil.process_iter(["name", "cmdline"]):
+        for pr in psutil.process_iter(["name", "cmdline", "exe"]):
             try:
-                if (pr.info["name"] or "").lower() != "chrome.exe":
+                if (pr.info["name"] or "").lower() != "chrome.exe" or not is_cent_process_exe(pr.info.get("exe") or ""):
                     continue
                 for a in pr.info["cmdline"] or []:
                     if a.startswith("--user-data-dir=") and norm_dir(a.split("=", 1)[1].strip('"')) == want:
@@ -173,6 +179,11 @@ def norm_dir(d):
 
 
 def launch_managed(p, exe, url=None, new_window=False, ext_dir=None, extra=None, minimized=False):
+    if not exe or not is_cent_exe(exe) or (CENT_EXE and norm_path(exe) != CENT_EXE):
+        log(f"launch {p.tag}: refused, not the configured Cent Browser exe ({exe})")
+        raise RuntimeError("Cent Browser exe set nahi / ghalat (Settings dekhein)")
+    if not p.data_dir:
+        raise RuntimeError("profile data folder missing")
     os.makedirs(p.data_dir, exist_ok=True)
     args = [exe, f"--user-data-dir={p.data_dir}", "--no-first-run", "--no-default-browser-check"] + list(extra or [])
     # docked windows sit inside the Manager, often out of sight: keep them rendering and their chats live
@@ -305,7 +316,7 @@ def focus_hwnd(hwnd):
 
 
 def focus_profile(profile, prefer_title=None):
-    wins = windows_for(profile)
+    wins = [w for w in windows_for(profile) if window_profile_ok(w[0], profile.data_dir)]
     if not wins:
         return False
     target = wins[0]
@@ -542,10 +553,12 @@ def _proc_has_bridge_flag(p):
     try:
         import psutil
         want = norm_dir(p.data_dir)
-        for pr in psutil.process_iter(["name", "cmdline"]):
+        for pr in psutil.process_iter(["name", "cmdline", "exe"]):
             cl = pr.info.get("cmdline") or []
             if not cl or any(a.startswith("--type=") for a in cl):
                 continue
+            if not is_cent_process_exe(pr.info.get("exe") or ""):
+                continue                 # personal Chrome / any other browser is never looked at
             if want and not any(a.startswith("--user-data-dir=") and norm_dir(a.split("=", 1)[1].strip('"')) == want for a in cl):
                 continue
             if not want:

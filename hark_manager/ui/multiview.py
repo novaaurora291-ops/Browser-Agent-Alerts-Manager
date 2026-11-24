@@ -164,9 +164,15 @@ class Pane(QFrame):
     def ask_hark(self):
         """Bring this window's Hark chat tab to the front (the bridge opens hark.com/chat only when it has none).
         Retried a few times: a bridge picks commands up on its next report (<= 30 s) or may be reloading."""
+        p = self.mv.ctl.profile(self.dir)
+        if p and self.mv.ctl.is_planner(p):
+            # the Shared Repo Team's Planner works in ChatGPT: never switch its tab to Hark
+            if self.hark_tries < 99:
+                log(f"multiview {self.dir}: team Planner, its tab is left as it is (no show_hark)")
+            self.hark_tries = 99
+            return
         if not self.hwnd or "hark" in chrome.window_title(self.hwnd).lower() or self.hark_tries >= 4:
             return
-        p = self.mv.ctl.profile(self.dir)
         if p and self.hark_tries >= 2 and not getattr(self, "hark_opened", False):
             # an older bridge copy has no show_hark: open hark.com/chat; the browser puts it in this (hosted) window
             self.hark_opened = True
@@ -180,7 +186,11 @@ class Pane(QFrame):
             with self.mv.ctl.bridge.lock:
                 q = self.mv.ctl.bridge.commands.get(key) or []
                 self.mv.ctl.bridge.commands[key] = [c for c in q if c.get("type") != "show_hark"]
-            self.mv.ctl.bridge.queue_command(key, {"type": "show_hark"})
+            cmd = {"type": "show_hark"}
+            wurl = self.mv.ctl.team_worker_url(p)
+            if wurl:
+                cmd["url"] = wurl         # a team worker: its own project tab, never another Hark tab
+            self.mv.ctl.bridge.queue_command(key, cmd)
             self.hark_tries += 1
             self.hark_next = time.time() + 35
 

@@ -142,7 +142,7 @@ class MainWindow(QMainWindow):
         for p in (self.profiles, self.alerts, self.settings, self.view):
             self.stack.addWidget(p)
         h.addWidget(self.stack, 1)
-        self.right = NeedsReplyPanel(ctl)
+        self.right = self._build_right(ctl)
         h.addWidget(self.right)
 
         self.mv = None
@@ -180,6 +180,54 @@ class MainWindow(QMainWindow):
         self.go(int(s["last_view"]) if s["restore_last_view"] else 0)
         if not ctl.bridge_ok:
             QTimer.singleShot(800, lambda: QMessageBox.warning(self, APP_TITLE, f"Bridge port {config.BRIDGE_PORT} busy hai: {ctl.bridge.error}\nKya app pehle se chal rahi hai?"))
+
+    def _build_right(self, ctl):
+        """Right panel: Needs reply, and the Team Plan & Safe Dispatch drawer (switch with the two tabs on top)."""
+        from .team_dispatch import TeamDispatchPanel
+        box = QWidget()
+        box.setObjectName("rightPanel")
+        box.setAttribute(Qt.WA_StyledBackground, True)
+        box.setFixedWidth(390)
+        v = QVBoxLayout(box)
+        v.setContentsMargins(10, 10, 10, 0)
+        v.setSpacing(0)
+        tabs = QHBoxLayout()
+        tabs.setSpacing(0)
+        self.rt_needs = QPushButton("Needs reply")
+        self.rt_team = QPushButton("Team Dispatch")
+        for b, rad in ((self.rt_needs, "border-top-left-radius:9px;border-bottom-left-radius:9px;"),
+                       (self.rt_team, "border-top-right-radius:9px;border-bottom-right-radius:9px;")):
+            b.setObjectName("seg")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setMinimumHeight(36)
+            b.setStyleSheet("font-size:15px;" + rad)
+            tabs.addWidget(b, 1)
+        self.rt_needs.setAccessibleName("Needs reply tab")
+        self.rt_team.setAccessibleName("Team Dispatch tab")
+        v.addLayout(tabs)
+        self.right_stack = QStackedWidget()
+        self.needs = NeedsReplyPanel(ctl)
+        self.needs.setMinimumWidth(0)
+        self.needs.setMaximumWidth(16777215)
+        self.team = TeamDispatchPanel(ctl)
+        self.right_stack.addWidget(self.needs)
+        self.right_stack.addWidget(self.team)
+        v.addWidget(self.right_stack, 1)
+
+        def show(i):
+            self.right_stack.setCurrentIndex(i)
+            self.rt_needs.setChecked(i == 0)
+            self.rt_team.setChecked(i == 1)
+            ctl.settings["right_drawer"] = i
+            ctl.settings.save()
+        self.rt_needs.clicked.connect(lambda: show(0))
+        self.rt_team.clicked.connect(lambda: show(1))
+        i = int(ctl.settings.get("right_drawer", 0) or 0)
+        self.right_stack.setCurrentIndex(i)
+        self.rt_needs.setChecked(i == 0)
+        self.rt_team.setChecked(i == 1)
+        return box
 
     def go(self, i):
         if self.stack.currentIndex() == 3 and i != 3:

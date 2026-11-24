@@ -2,12 +2,12 @@
 import threading
 import os
 import time
-EXT_VERSION = "1.0.15"
+EXT_VERSION = "1.0.16"   # must equal extension/manifest.json "version"
 ALERT_GRACE = 15  # an alert Hark no longer shows as waiting (live DOM) is cleared after this many seconds
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from . import chrome, notify, config
+from . import chrome, notify, config, repo_team
 from .alerts import AlertStore
 from .bridge import Bridge
 from .config import Settings, get_bot_token, log
@@ -66,13 +66,22 @@ class Controller(QObject):
     need_telegram_setup = Signal(str)
     limit_result = Signal(str, dict)   # profile_dir, read-only Hark limit probe from the bridge
     view_request = Signal(str, str)    # profile_dir, preferred window title -> show it inside the Manager
+    team_changed = Signal()            # Shared Repo Team saved / worktrees verified
+    verify_done = Signal(str, dict)    # verify id, result
+    dispatch_update = Signal(str, dict)  # dispatch id, record
 
     def __init__(self):
         super().__init__()
         self.settings = Settings()
         self.alerts = AlertStore()
         self.bridge = Bridge()
+        self.bridge.ext_version = EXT_VERSION
         self.bridge_ok = self.bridge.start()
+        self.verifies = {}    # verify id -> {tag, url, t}
+        self.dispatches = {}  # dispatch id -> record (Safe Dispatch)
+        self.sent_keys = {}   # (tag, url, sha256(prompt)) -> dispatch id: the same prompt is never sent twice
+        self.worktrees_ok = {}  # alias -> (ok, reason) from the last git check
+        self.cent_error = ""
         self.profiles = []
         self.by_email = {}
         self.by_tag = {}
@@ -104,6 +113,10 @@ class Controller(QObject):
         QTimer.singleShot(300, self.refresh_windows)
         QTimer.singleShot(800, self.refresh_previews)
         QTimer.singleShot(500, self.check_telegram)
+        self.t_dispatch = QTimer(self, timeout=self._dispatch_tick, interval=500)
+        self.t_dispatch.start()
+        self.t_snap = QTimer(self, timeout=self._write_snapshot, interval=4000)
+        self.t_snap.start()
 
     # ---------- profiles ----------
     def reload_profiles(self):
@@ -112,12 +125,13 @@ class Controller(QObject):
         aliases = self.settings["aliases"] or {}
         cent = self.cent_exe()
         chrome.set_cent_exe(cent)
+        self.cent_error = self.cent_status()[1]
         cdir = os.path.dirname(chrome.norm_path(cent)) if cent else ""
         managed = []
         for m in self.settings["managed_profiles"] or []:
             rexe = chrome.norm_path((m.get("exe") or "").strip('"'))
-            if not cent or (rexe and os.path.dirname(rexe) != cdir):
-                continue      # made with another browser / another Cent install: not linked to this Cent
+            if m.get("legacy") or not cent or (rexe and os.path.dirname(rexe) != cdir):
+                continue      # made with another browser / another Cent install: kept in settings, not linked
             p = chrome.Profile("hbm:" + m["id"], m.get("name") or m["id"])
             p.kind, p.tag, p.data_dir, p.exe = "managed", m["id"], m["data_dir"], m.get("exe", "")
             p.email = chrome.managed_email(p.data_dir) or m.get("email", "")
@@ -128,6 +142,18 @@ class Controller(QObject):
         # bridge reports are matched by each profile's own tag only (a bridge in personal Chrome maps to nothing)
         self.by_email = {}
         self.by_tag = {p.tag: p for p in managed}
+        # each managed profile's own bridge token: only requests carrying it are accepted
+        toks = {}
+        for p in managed:
+            try:
+                toks[p.tag] = config.bridge_token(p.tag)
+                # current bridge files + this profile's token in its own copy: a running older bridge is told to
+                # reload (bridge.py) and comes back as the new version, authenticated
+                if os.path.isdir(p.data_dir):
+                    config.ensure_profile_extension(p.data_dir, p.tag)
+            except Exception as e:
+                log(f"bridge token {p.tag}: {e}")
+        self.bridge.set_tokens(toks)
         self.changed.emit()
 
     def bridge_key(self, p):
@@ -150,6 +176,20 @@ class Controller(QObject):
 
     browser_exe = cent_exe
 
+    def cent_status(self):
+        """(ok, message) about the Cent Browser exe, shown in Settings when something is wrong."""
+        exe = (self.settings["browser_exe"] or "").strip().strip('"')
+        if exe:
+            if not os.path.isfile(exe):
+                return False, f"Cent Browser exe nahi mili: {exe}. Settings mein sahi Cent chrome.exe chunein."
+            if not chrome.is_cent_exe(exe):
+                return False, f"Yeh Cent Browser nahi hai: {exe}. Sirf Cent Browser supported hai."
+            return True, ""
+        found = chrome.detect_cent()
+        if not found:
+            return False, "Cent Browser install nahi mila. Settings mein Cent Browser ki chrome.exe chunein."
+        return True, ""
+
     def exe_for(self, p):
         """Every profile runs on the configured Cent exe (the one its windows are matched against)."""
         return self.cent_exe()
@@ -169,8 +209,12 @@ class Controller(QObject):
         if not m.get("tagged") and not url:
             url = "https://hark.com/"
         dock = bool(self.settings["keep_docked"]) and p.directory not in self.no_dock
-        chrome.launch_managed(p, exe, url, new_window, config.ensure_profile_extension(p.data_dir, p.tag), extra,
-                              minimized=dock)
+        try:
+            chrome.launch_managed(p, exe, url, new_window, config.ensure_profile_extension(p.data_dir, p.tag), extra,
+                                  minimized=dock)
+        except Exception as e:
+            log(f"open {p.directory}: {e}")
+            return False
         return True
 
     def _managed_rec(self, tag):
@@ -367,10 +411,16 @@ class Controller(QObject):
             self._reloaded = time.time()
             self.reload_profiles()
             p = self.by_tag.get(tag) or (self.by_email.get(email) if email else None)
-        if not p:
+        if not p or not rep.get("_auth"):
             if not getattr(self, "_unmapped_logged", None) or time.time() - self._unmapped_logged > 60:
                 self._unmapped_logged = time.time()
                 log(f"bridge report not mapped to a profile (email={email or '-'} tag={tag or '-'}, ext {rep.get('ext_id')})")
+            return False
+        if rep.get("verify_result") is not None:
+            self._on_verify(p, rep["verify_result"])
+            return False
+        if rep.get("dispatch_result") is not None:
+            self._on_dispatch_result(p, rep["dispatch_result"])
             return False
         if True:
             m = self._managed_rec(p.tag)
@@ -398,14 +448,17 @@ class Controller(QObject):
             return False
         # an older bridge copy is running in this profile: ask it to reload itself (at most once a minute)
         checking = time.time() - st.get("checking", 0) < 60     # never reload the bridge in the middle of a Check Limit
-        if rep.get("limit_result") is None and rep.get("ver") != EXT_VERSION and not checking and time.time() - st.get("reload_asked", 0) > 60:
+        stale = rep.get("ver") != EXT_VERSION or (rep.get("build") or "") != config.extension_build()
+        if any(d["tag"] == p.tag and d["status"] in ("queued", "sending") for d in self.dispatches.values()):
+            stale = False         # never reload a bridge in the middle of a dispatch
+        if rep.get("limit_result") is None and stale and not checking and time.time() - st.get("reload_asked", 0) > 60:
             st["reload_asked"] = time.time()
             try:   # put the current files where this profile loads the bridge from, then let it reload itself
                 config.ensure_profile_extension(p.data_dir, p.tag)
             except Exception as e:
                 log(f"bridge files update {p.directory}: {e}")
             self.bridge.queue_command(self.bridge_key(p), {"type": "reload_ext"})
-            log(f"bridge in {p.directory} is {rep.get('ver')}, asked to reload to {EXT_VERSION}")
+            log(f"bridge in {p.directory} is {rep.get('ver')}/{rep.get('build') or '-'}, asked to reload to {EXT_VERSION}/{config.extension_build()}")
         if time.time() - st["t"] >= STALE:
             st["live_since"] = time.time()  # bridge (re)connected: give alerts a fresh grace window
         st["t"] = rep["_t"]
@@ -414,6 +467,8 @@ class Controller(QObject):
         st["hark"] = {k: v for k, v in st["hark"].items() if k in live_tabs}
         h = rep.get("hark")
         changed = False
+        if h and h.get("projects"):
+            st["projects"] = h["projects"][:40]
         if h and h.get("tabId") is not None:
             prev = st["hark"].get(h["tabId"])
             h["_t"] = rep["_t"]
@@ -685,3 +740,214 @@ class Controller(QObject):
 
     def needs_reply_count(self):
         return len(self.alerts.open_alerts())
+
+    # ---------- Shared Repo Team ----------
+    def team(self):
+        return repo_team.load(self.settings)
+
+    def team_profile_ids(self):
+        t = self.team()
+        if not repo_team.is_configured(t):
+            return "", []
+        return (t.get("planner") or {}).get("profile_id", ""), [w.get("profile_id") for w in t.get("workers") or []]
+
+    def project_urls(self, tag):
+        """[(url, title)] of the Hark projects this profile's sidebar shows (from its bridge)."""
+        p = self.by_tag.get(tag)
+        st = self.state.get(p.directory) if p else None
+        return [(f"https://hark.com/project/{x['id']}", x.get("title", "")) for x in (st or {}).get("projects") or []
+                if repo_team.PROJECT_URL_RE.match(f"https://hark.com/project/{x.get('id', '')}")]
+
+    def team_worker_url(self, p):
+        t = self.team()
+        if not p or not repo_team.is_configured(t):
+            return ""
+        return next((w.get("project_url") or "" for w in t.get("workers") or [] if w.get("profile_id") == p.tag), "")
+
+    def is_planner(self, p):
+        return bool(p) and self.team_profile_ids()[0] == p.tag
+
+    def save_team(self, team):
+        """Save the team and create/reuse one worktree per worker from ONE base commit (git, no shell)."""
+        team, res = repo_team.setup_worktrees(team)
+        repo_team.save(self.settings, team)
+        self.worktrees_ok = res
+        self.team_changed.emit()
+        return team, res
+
+    def check_worktrees(self):
+        t = self.team()
+        self.worktrees_ok = repo_team.verify_all(t) if repo_team.is_configured(t) else {}
+        self.team_changed.emit()
+        return self.worktrees_ok
+
+    def worktrees_ready(self):
+        t = self.team()
+        ws = t.get("workers") or []
+        return bool(ws) and all((self.worktrees_ok.get(w.get("alias")) or (False,))[0] for w in ws)
+
+    # ---------- Safe Dispatch (bridge side) ----------
+    VERIFY_TIMEOUT = 15     # s for a profile's bridge to answer a fresh tab check
+    PICKUP_TTL = 45         # s a send command may wait for its bridge; after that its dispatch ID is dead
+    ACK_TIMEOUT = 60        # s after pickup without a result -> Unconfirmed (never re-sent)
+
+    def verify_tab(self, tag, url):
+        """Fresh check of this profile's exact project tab. Answer comes as verify_done(vid, result)."""
+        import uuid
+        vid = uuid.uuid4().hex
+        p = self.by_tag.get(tag)
+        self.verifies[vid] = {"tag": tag, "url": url, "t": time.time()}
+        if not p:
+            QTimer.singleShot(0, lambda: self._verify_finish(vid, {"ok": False, "code": "no_profile", "reason": "Profile not found"}))
+            return vid
+        if not (self.windows.get(p.directory) or p.directory in self.embedded):
+            QTimer.singleShot(0, lambda: self._verify_finish(vid, {"ok": False, "code": "closed", "reason": "Browser closed"}))
+            return vid
+        self.bridge.drop_command(tag, lambda c: c.get("type") == "verify_tab" and c.get("url") == url)
+        self.bridge.queue_command(tag, {"type": "verify_tab", "vid": vid, "url": url})
+        return vid
+
+    def _verify_finish(self, vid, res):
+        v = self.verifies.pop(vid, None)
+        if v is None:
+            return
+        res = dict(res, tag=v["tag"], url=v["url"], vid=vid, at=time.time())
+        self.verify_done.emit(vid, res)
+
+    def _on_verify(self, p, vr):
+        vid = vr.get("vid") or ""
+        v = self.verifies.get(vid)
+        if not v or v["tag"] != p.tag or vr.get("url") != v["url"]:
+            log(f"verify result ignored (unknown id or wrong profile) from {p.tag}")
+            return
+        url = v["url"]
+        tabs = [t for t in (vr.get("tabs") or []) if (t.get("url") or "") == url]
+        if not tabs:
+            return self._verify_finish(vid, {"ok": False, "code": "tab_missing", "reason": "Tab Missing"})
+        act = [t for t in tabs if t.get("active")]
+        if not act:
+            return self._verify_finish(vid, {"ok": False, "code": "not_active", "reason": "Tab not active", "tabs": len(tabs)})
+        if len(act) > 1:
+            return self._verify_finish(vid, {"ok": False, "code": "ambiguous", "reason": f"{len(act)} active tabs with this URL"})
+        t = act[0]
+        pr = t.get("probe") or {}
+        if pr.get("err"):
+            why = "Tab not readable"
+        elif pr.get("url") != url:
+            why = "Tab URL changed"
+        elif pr.get("signin"):
+            why = "Not signed in"
+        elif not pr.get("composer"):
+            why = "Composer not found"
+        elif not pr.get("ready"):
+            why = "Composer not ready"
+        elif not pr.get("empty"):
+            why = "Composer not empty"
+        elif pr.get("running"):
+            why = "Agent running"
+        else:
+            why = ""
+        if why:
+            return self._verify_finish(vid, {"ok": False, "code": "not_ready", "reason": why, "tab_id": t.get("id")})
+        self._verify_finish(vid, {"ok": True, "code": "verified", "reason": "Tab Verified", "tab_id": t.get("id"),
+                                  "window_id": t.get("windowId")})
+
+    @staticmethod
+    def prompt_key(tag, url, text):
+        import hashlib
+        return (tag, url, hashlib.sha256((text or "").encode("utf-8")).hexdigest())
+
+    def already_sent(self, tag, url, text):
+        did = self.sent_keys.get(self.prompt_key(tag, url, text))
+        return self.dispatches.get(did) if did else None
+
+    def send_prompt(self, tag, tab_id, url, text, alias=""):
+        """Queue ONE send of `text` to the verified tab. Returns the dispatch record (or None if refused).
+        The same (profile, project, prompt) is never queued twice in a session; a dispatch ID expires."""
+        import uuid
+        key = self.prompt_key(tag, url, text)
+        prev = self.sent_keys.get(key)
+        if prev and self.dispatches.get(prev, {}).get("status") not in ("blocked", "expired"):
+            log(f"dispatch {alias}: refused, same prompt already dispatched ({prev[:8]})")
+            return None
+        if not repo_team.PROJECT_URL_RE.match(url or "") or tab_id is None:
+            return None
+        did = uuid.uuid4().hex
+        now = time.time()
+        rec = {"id": did, "tag": tag, "alias": alias, "url": url, "tab_id": tab_id, "status": "queued", "reason": "",
+               "t": now, "expires": now + self.PICKUP_TTL, "picked": 0, "key": key, "chars": len(text)}
+        self.dispatches[did] = rec
+        self.sent_keys[key] = did
+        self.bridge.queue_command(tag, {"type": "send_text", "dispatch_id": did, "tab_id": tab_id, "url": url,
+                                        "text": text, "expires_ms": int(rec["expires"] * 1000)})
+        log(f"dispatch {did[:8]} {alias} -> {tag} tab {tab_id} {url} ({len(text)} chars) queued")
+        self._dispatch_log(rec)
+        self.dispatch_update.emit(did, dict(rec))
+        return rec
+
+    def _set_dispatch(self, rec, status, reason):
+        rec["status"], rec["reason"], rec["done"] = status, reason, time.time()
+        log(f"dispatch {rec['id'][:8]} {rec.get('alias')}: {status} {reason}")
+        self._dispatch_log(rec)
+        self.dispatch_update.emit(rec["id"], dict(rec))
+
+    def _on_dispatch_result(self, p, dr):
+        did = dr.get("dispatch_id") or ""
+        rec = self.dispatches.get(did)
+        if not rec or rec["tag"] != p.tag:
+            log(f"dispatch result ignored (unknown id or wrong profile {p.tag})")
+            return
+        st = dr.get("status") or "unconfirmed"
+        if rec["status"] in ("sent", "blocked", "expired", "duplicate"):
+            return                        # final already: a late or repeated answer changes nothing
+        if rec["status"] == "unconfirmed" and st != "sent":
+            return                        # only a late confirmation may still turn Unconfirmed into Sent
+        if st not in ("sent", "unconfirmed", "blocked", "expired", "duplicate"):
+            st = "unconfirmed"
+        self._set_dispatch(rec, st, dr.get("reason") or "")
+
+    def _dispatch_tick(self):
+        now = time.time()
+        for vid, v in list(self.verifies.items()):
+            if now - v["t"] > self.VERIFY_TIMEOUT:
+                self.bridge.drop_command(v["tag"], lambda c, vid=vid: c.get("vid") == vid)
+                self._verify_finish(vid, {"ok": False, "code": "no_answer", "reason": "Bridge did not answer"})
+        for did, rec in list(self.dispatches.items()):
+            if rec["status"] != "queued" and rec["status"] != "sending":
+                continue
+            picked = self.bridge.picked.get(did)
+            if picked and rec["status"] == "queued":
+                rec["status"], rec["picked"] = "sending", picked
+                self.dispatch_update.emit(did, dict(rec))
+            if not picked and now > rec["expires"]:
+                n = self.bridge.drop_command(rec["tag"], lambda c, did=did: c.get("dispatch_id") == did)
+                self._set_dispatch(rec, "expired", "bridge did not pick it up in time; not sent" + ("" if n else " (gone)"))
+            elif picked and now - picked > self.ACK_TIMEOUT:
+                self._set_dispatch(rec, "unconfirmed", "no confirmation from the page (not re-sent)")
+
+    def _dispatch_log(self, rec):
+        import json
+        try:
+            with open(os.path.join(config.APPDATA, "dispatch_log.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps({k: v for k, v in rec.items() if k != "key"}) + "\n")
+        except Exception:
+            pass
+
+    def _write_snapshot(self):
+        """Live tabs per managed profile (no secrets, no page text) for troubleshooting: bridge_state.json."""
+        import json
+        try:
+            out = {}
+            for p in self.profiles:
+                st = self.state.get(p.directory) or {}
+                out[p.tag] = {"name": p.name, "ver": st.get("ver", ""), "age": round(time.time() - st.get("t", 0), 1),
+                              "open": bool(self.windows.get(p.directory)) or p.directory in self.embedded,
+                              "tabs": [{"id": t.get("id"), "active": t.get("active"), "url": t.get("url", "")[:200]}
+                                       for t in st.get("tabs") or []],
+                              "projects": st.get("projects") or []}
+            tmp = os.path.join(config.APPDATA, "bridge_state.json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"t": time.time(), "ext": EXT_VERSION, "profiles": out}, f, indent=1)
+            os.replace(tmp, os.path.join(config.APPDATA, "bridge_state.json"))
+        except Exception:
+            pass
