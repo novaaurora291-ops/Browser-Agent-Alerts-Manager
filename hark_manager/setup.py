@@ -72,7 +72,13 @@ class CDP:
             pass
 
     def session(self, target):
-        return Session(target["webSocketDebuggerUrl"])
+        """A DevTools session bound to this one tab: all input goes to it, never to the OS cursor/keyboard."""
+        s = Session(target["webSocketDebuggerUrl"])
+        try:
+            s.call("Emulation.setFocusEmulationEnabled", {"enabled": True})   # page acts focused even in background
+        except Exception:
+            pass
+        return s
 
 
 class Session:
@@ -100,6 +106,11 @@ class Session:
     def type_text(self, text):
         self.call("Input.insertText", {"text": text})
 
+    def gesture_js(self, expr):
+        """Run JS in this tab as if the user acted (user activation), without focus or the real cursor."""
+        r = self.call("Runtime.evaluate", {"expression": expr, "returnByValue": True, "userGesture": True})
+        return r.get("result", {}).get("value")
+
     def close(self):
         try:
             self.ws.close()
@@ -116,6 +127,10 @@ def parse_dob(text):
     except Exception:
         return None
 
+
+GOOGLE_BTN_CLICK = """(()=>{try{const f=[...document.querySelectorAll('iframe')].find(f=>/framed-sign-in/.test(f.src)&&f.getBoundingClientRect().top<1500);
+const d=f?f.contentDocument:document;const b=[...d.querySelectorAll('button,a,[role=button]')].find(x=>/Continue with Google/i.test(x.innerText||''));
+if(!b)return 'nobtn';b.click();return 'clicked'}catch(e){return 'err'}})()"""
 
 BIRTHDAY_JS = """(()=>{const v=%s;const ss=[...document.querySelectorAll('select')];if(ss.length<3)return 'wait';
 const set=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set;
@@ -184,7 +199,13 @@ class ProfileSetup(QObject):
             self.port = free_port()
             self.cdp = CDP(self.port)
             first = BROWSEC_URL if self.cent else "https://hark.com/"
-            self.ctl.open_in(self.p, first, extra=[f"--remote-debugging-port={self.port}", "--remote-allow-origins=*"])
+            # keep this profile's tabs fully alive even when its window is behind the dashboard,
+            # so the in-tab typing/clicks never need the real foreground window
+            self.ctl.open_in(self.p, first, extra=[f"--remote-debugging-port={self.port}", "--remote-allow-origins=*",
+                                                    "--disable-backgrounding-occluded-windows",
+                                                    "--disable-renderer-backgrounding",
+                                                    "--disable-background-timer-throttling",
+                                                    "--disable-features=CalculateNativeWinOcclusion"])
             end = time.time() + 40
             while True:
                 try:
@@ -385,7 +406,8 @@ class ProfileSetup(QObject):
             if "staticstream.org" in u or "installed_compare" in u or "browsec.com" in u:
                 self.cdp.close(x["id"])
         t = self._page("hark.com", 3) or self.cdp.new("https://hark.com/")
-        self.cdp.activate(t["id"])
+        if self.mode == "manual":
+            self.cdp.activate(t["id"])     # manual: the user signs in here, so show this tab
         s = self.cdp.session(t)
         try:
             if "hark.com" not in t.get("url", "") or "robots" in t.get("url", ""):
@@ -423,9 +445,9 @@ class ProfileSetup(QObject):
             r = s.js(js)
             if not r or r == "wait":
                 continue
-            x, y = json.loads(r)
-            s.call("Page.bringToFront")
-            s.click_at(x, y)        # in-browser trusted click (no real cursor)
+            # click inside this tab only, with user activation: works even when the tab/window is in the
+            # background, so the dashboard (or any other window) can stay in front
+            s.gesture_js(GOOGLE_BTN_CLICK)
             for _ in range(10):
                 self._sleep(1)
                 if self._page("accounts.google.com", 0.1) or "accounts.google.com" in (s.js("location.href") or ""):
@@ -466,9 +488,20 @@ class ProfileSetup(QObject):
             gs.close()
 
     def _fill(self, s, sel, text):
+        q = json.dumps(sel)
         for _ in range(30):
-            if s.js(f"""(()=>{{const e=document.querySelector({json.dumps(sel)});if(!e||e.getBoundingClientRect().width==0)return false;e.focus();e.value='';return true}})()"""):
-                s.type_text(text)
+            if s.js(f"""(()=>{{const e=document.querySelector({q});if(!e||e.getBoundingClientRect().width==0)return false;e.focus();e.value='';return true}})()"""):
+                s.type_text(text)          # typed into this tab's field only
+                n = s.js(f"""(()=>{{const e=document.querySelector({q});return e?e.value.length:-1}})()""")
+                if n != len(text):          # background tab didn't take the keystrokes: set the field directly
+                    s.call("Runtime.callFunctionOn", {
+                        "functionDeclaration": "function(v){const e=document.querySelector(" + q + ");"
+                        "const set=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;"
+                        "e.focus();set.call(e,v);e.dispatchEvent(new Event('input',{bubbles:true}));"
+                        "e.dispatchEvent(new Event('change',{bubbles:true}));}",
+                        "objectId": s.call("Runtime.evaluate", {"expression": "window"})["result"]["objectId"],
+                        "arguments": [{"value": text}]})
+                    log(f"setup {self.p.tag}: field set directly (tab in background)")
                 return True
             self._sleep(0.7)
         return False

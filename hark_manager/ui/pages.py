@@ -487,9 +487,32 @@ class ProfilesPage(QWidget):
         self._update_cols()
 
     def add_profile(self):
+        """Non-modal: one Add profile window at a time; if setup is running (even hidden) bring it back."""
         from .add_profile import AddProfileDialog
-        AddProfileDialog(self).exec()
-        self.rebuild()
+        d = getattr(self, "_add_dlg", None)
+        if d is not None:
+            try:
+                d.showNormal()
+                d.raise_()
+                d.activateWindow()
+                return
+            except RuntimeError:      # already deleted
+                self._add_dlg = None
+        d = AddProfileDialog(self)
+        d.busy.connect(self._add_busy)
+        self._add_dlg = d
+        d.show()
+
+    def _add_busy(self, done, total):
+        if done == -1:                # window closed
+            self._add_dlg = None
+            self.addbtn.setText("  Add profile")
+            self.rebuild()
+        elif done == -2:              # all jobs finished, window still open
+            self.addbtn.setText("  Add profile · done")
+        else:
+            self.addbtn.setText(f"  Setup {done}/{total}…")
+            self.addbtn.setToolTip("Add profile window: setup background mein chal raha hai")
 
 
 # ======================= Alerts =======================

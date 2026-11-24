@@ -2,9 +2,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 import re
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QFrame, QWidget,
-                               QButtonGroup, QMessageBox, QComboBox, QPlainTextEdit, QScrollArea)
+                               QButtonGroup, QMessageBox, QComboBox, QPlainTextEdit, QScrollArea, QSizePolicy)
 
 from . import icons
 from .widgets import label, button
@@ -14,19 +14,22 @@ from ..setup import ProfileSetup, parse_dob
 
 DLG_QSS = f"""
 QDialog {{ background: white; }}
-QLabel#flabel {{ font-size: 16px; font-weight: 700; }}
-QLineEdit {{ min-height: 30px; font-size: 15px; }}
+QWidget#formw {{ background: white; }}
+QLabel#flabel {{ font-size: 14px; font-weight: 700; }}
+QLineEdit {{ min-height: 26px; font-size: 14px; }}
 QLineEdit:read-only {{ background: #EEF0F2; }}
-QPushButton#mode {{ background: white; border: 1.5px solid #D6DADF; border-radius: 9px; padding: 10px 14px; font-size: 15px; text-align: left; }}
+QPushButton#mode {{ background: white; border: 1.5px solid #D6DADF; border-radius: 9px; padding: 7px 12px; font-size: 14px; text-align: left; }}
 QPushButton#mode:checked {{ background: {LIME_SOFT}; border-color: {LIME_BORDER}; font-weight: 600; }}
 QFrame#steps {{ background: #FAFBFB; border: 1px solid {BORDER}; border-radius: 12px; }}
-QPlainTextEdit {{ background: white; border: 1px solid #CDD1D6; border-radius: 9px; padding: 6px; font-family: Consolas; font-size: 15px; }}
-QPushButton#tab {{ background: white; border: 1.5px solid #D6DADF; padding: 9px 30px; font-size: 16px; min-width: 150px; }}
+QPlainTextEdit {{ background: white; border: 1px solid #CDD1D6; border-radius: 9px; padding: 6px; font-family: Consolas; font-size: 13px; }}
+QPushButton#tab {{ background: white; border: 1.5px solid #D6DADF; padding: 7px 18px; font-size: 14px; min-width: 120px; }}
 QPushButton#primary:disabled {{ background: #DDE3D3; color: #8A9081; }}
 QPushButton#tab:checked {{ background: {LIME}; border-color: {LIME}; font-weight: 700; }}
-QPushButton#cnt {{ background: #F3F4F5; border: 1px solid #CDD1D6; min-width: 44px; min-height: 36px; font-size: 18px; font-weight: 700; }}
-QFrame#prow {{ background: white; border: 1px solid #E3E6EA; border-radius: 10px; }}
-QLabel#num {{ border: 1.5px solid #CDD1D6; border-radius: 15px; min-width: 30px; max-width: 30px; min-height: 30px; max-height: 30px; font-weight: 700; qproperty-alignment: AlignCenter; background: white; }}
+QPushButton#cnt {{ background: #F3F4F5; border: 1px solid #CDD1D6; min-width: 34px; min-height: 30px; font-size: 16px; font-weight: 700; }}
+QFrame#prow {{ background: white; border: 1px solid #E3E6EA; border-radius: 9px; }}
+QPushButton#mini {{ background: white; border: 1px solid #CDD1D6; border-radius: 7px; padding: 2px 9px; font-size: 12px; }}
+QPushButton#mini:hover {{ border-color: #8A9099; }}
+QLabel#num {{ border: 1.5px solid #CDD1D6; border-radius: 13px; min-width: 26px; max-width: 26px; min-height: 26px; max-height: 26px; font-weight: 700; qproperty-alignment: AlignCenter; background: white; }}
 """
 
 COLORS = {"wait": MUTED, "run": "#1f6feb", "ok": GREEN, "user": "#B26A00", "fail": "#C62828", "skip": MUTED}
@@ -37,24 +40,24 @@ class StepRow(QWidget):
     def __init__(self, n, title, sub):
         super().__init__()
         h = QHBoxLayout(self)
-        h.setContentsMargins(0, 6, 0, 6)
-        h.setSpacing(14)
+        h.setContentsMargins(0, 3, 0, 3)
+        h.setSpacing(10)
         self.n = n
         self.num = QLabel(str(n))
         self.num.setObjectName("num")
         h.addWidget(self.num, 0, Qt.AlignTop)
         v = QVBoxLayout()
         v.setSpacing(2)
-        v.addWidget(label(title, size=17, bold=True))
+        v.addWidget(label(title, size=14, bold=True))
         self.sub = label(sub, wrap=True, color=MUTED)
-        self.sub.setStyleSheet(f"font-size:14px;color:{MUTED}")
+        self.sub.setStyleSheet(f"font-size:12px;color:{MUTED}")
         v.addWidget(self.sub)
         h.addLayout(v, 1)
 
     def set_state(self, state, text):
         c = COLORS.get(state, MUTED)
         self.sub.setText(text)
-        self.sub.setStyleSheet(f"font-size:14px;color:{c}")
+        self.sub.setStyleSheet(f"font-size:12px;color:{c}")
         mk = MARK.get(state, "")
         self.num.setText(mk or str(self.n))
         bg = {"ok": LIME, "fail": "#FFD9D9", "user": "#FFF1D6", "run": "#E6F0FF"}.get(state, "white")
@@ -66,49 +69,65 @@ EMAIL_RE = re.compile(r"^[^@\s|]+@[^@\s|]+\.[^@\s|]+$")
 
 
 class ProgressRow(QFrame):
-    """One profile in a Multiple-profiles run: name, account, current step and its own result."""
+    """One setup job in the side progress panel: name, account, current step, its own Stop."""
     STEP_NAMES = {1: "Create profile", 2: "Browsec VPN", 3: "US VPN", 4: "Hark sign-in"}
 
     def __init__(self, dlg, idx, name, email):
         super().__init__()
-        self.dlg, self.idx, self.p = dlg, idx, None
+        self.dlg, self.idx, self.p, self.job = dlg, idx, None, None
         self.setObjectName("prow")
-        h = QHBoxLayout(self)
-        h.setContentsMargins(14, 8, 14, 8)
-        h.setSpacing(12)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 7, 10, 8)
+        v.setSpacing(3)
+        top = QHBoxLayout()
+        top.setSpacing(8)
         self.num = QLabel(str(idx + 1))
         self.num.setObjectName("num")
-        h.addWidget(self.num)
-        col = QVBoxLayout()
-        col.setSpacing(1)
-        self.name = label(name, size=16, bold=True)
-        col.addWidget(self.name)
+        top.addWidget(self.num)
+        self.name = label(name, size=13, bold=True)
+        self.name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.name.setToolTip(name)
+        top.addWidget(self.name, 1)
+        self.stopb = QPushButton("Stop")
+        self.stopb.setObjectName("mini")
+        self.stopb.setCursor(Qt.PointingHandCursor)
+        self.stopb.setAccessibleName(f"Stop {name}")
+        self.stopb.clicked.connect(lambda: self.dlg.stop_job(self.job))
+        top.addWidget(self.stopb)
+        v.addLayout(top)
         self.sub = label(email or "Manual sign-in", color=MUTED)
-        col.addWidget(self.sub)
-        h.addLayout(col, 3)
+        self.sub.setStyleSheet(f"font-size:11px;color:{MUTED}")
+        self.sub.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        v.addWidget(self.sub)
         self.state = label("Queued", wrap=True, color=MUTED)
-        self.state.setStyleSheet(f"font-size:14px;color:{MUTED}")
-        h.addWidget(self.state, 4)
-        self.focus = button("Open window", "outline")
+        self.state.setStyleSheet(f"font-size:12px;color:{MUTED}")
+        self.state.setAccessibleName(f"Status {name}")
+        v.addWidget(self.state)
+        self.focus = QPushButton("Open window")
+        self.focus.setObjectName("mini")
         self.focus.setVisible(False)
         self.focus.clicked.connect(self.open_window)
-        h.addWidget(self.focus)
+        v.addWidget(self.focus, 0, Qt.AlignLeft)
 
     def set(self, step, state, text):
         c = COLORS.get(state, MUTED)
         prefix = {"user": "Needs action: ", "fail": "FAIL: "}.get(state, "")
         self.state.setText(f"{step}/4 {self.STEP_NAMES.get(step, '')} · {prefix}{text}")
-        self.state.setStyleSheet(f"font-size:14px;color:{c};" + ("font-weight:700;" if state in ("user", "fail") else ""))
+        self.state.setAccessibleName(self.state.text())
+        self.state.setStyleSheet(f"font-size:12px;color:{c};" + ("font-weight:700;" if state in ("user", "fail") else ""))
         bg = {"ok": LIME, "fail": "#FFD9D9", "user": "#FFF1D6", "run": "#E6F0FF"}.get(state, "white")
         self.num.setStyleSheet(f"background:{bg};border-color:{c}")
         self.focus.setVisible(state == "user" and self.p is not None)
 
-    def finish(self, ok, msg):
-        self.state.setText(("PASS · " if ok else "FAIL · ") + msg)
-        self.state.setStyleSheet(f"font-size:14px;font-weight:700;color:{GREEN if ok else '#C62828'}")
-        self.num.setText("✓" if ok else "!")
-        self.num.setStyleSheet(f"background:{LIME if ok else '#FFD9D9'};border-color:{GREEN if ok else '#C62828'}")
+    def finish(self, ok, msg, cancelled=False):
+        col = MUTED if cancelled else (GREEN if ok else "#C62828")
+        self.state.setText(("Stopped · " if cancelled else ("PASS · " if ok else "FAIL · ")) + msg)
+        self.state.setAccessibleName(self.state.text())
+        self.state.setStyleSheet(f"font-size:12px;font-weight:700;color:{col}")
+        self.num.setText("–" if cancelled else ("✓" if ok else "!"))
+        self.num.setStyleSheet(f"background:{'white' if cancelled else (LIME if ok else '#FFD9D9')};border-color:{col}")
         self.focus.setVisible(False)
+        self.stopb.setVisible(False)
 
     def open_window(self):
         if self.p:
@@ -116,8 +135,14 @@ class ProgressRow(QFrame):
 
 
 class AddProfileDialog(QDialog):
+    """Non-modal, resizable window: the dashboard stays usable while setup jobs run in the background."""
+    busy = Signal(int, int)       # (finished jobs, total jobs) while running; (-1, -1) when the window is gone
+
     def __init__(self, page):
-        super().__init__(page)
+        super().__init__(None)
+        self.setWindowFlags(Qt.Window | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint)
+        self.setWindowModality(Qt.NonModal)
+        self.setAttribute(Qt.WA_DeleteOnClose)
         self.page, self.ctl = page, page.ctl
         self.setup = None
         self.running = False
@@ -125,17 +150,20 @@ class AddProfileDialog(QDialog):
         self._pws = {}          # email -> password, only while the dialog lives; each is dropped once used
         self.queue = []
         self.setWindowTitle("Add profile")
-        self.setStyleSheet(DLG_QSS)
-        self.setMinimumWidth(980)
+        from .style import build_qss
+        self.setStyleSheet(build_qss() + DLG_QSS)   # own top-level window: bring the app look along
+        self.resize(760, 560)
+        self.setMinimumSize(620, 440)
+        self.jobs = []
         exe = self.ctl.browser_exe()
         self.managed = bool(exe)
         self.bname = chrome_mod.browser_name(exe) if exe else "Google Chrome"
         self.cent = "cent" in self.bname.lower()
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(28, 18, 28, 20)
-        root.setSpacing(14)
-        root.addWidget(label("Add profile", size=28, bold=True))
+        root.setContentsMargins(20, 12, 20, 12)
+        root.setSpacing(8)
+        root.addWidget(label("Add profile", size=20, bold=True))
 
         tabs = QHBoxLayout()
         tabs.setSpacing(0)
@@ -159,9 +187,12 @@ class AddProfileDialog(QDialog):
         root.addLayout(tabs)
 
         body = QHBoxLayout()
-        body.setSpacing(26)
-        form = QVBoxLayout()
-        form.setSpacing(8)
+        body.setSpacing(16)
+        self.form_w = QWidget()
+        self.form_w.setObjectName("formw")
+        form = QVBoxLayout(self.form_w)
+        form.setContentsMargins(0, 0, 8, 0)
+        form.setSpacing(5)
 
         def fl(t):
             l = QLabel(t)
@@ -180,7 +211,7 @@ class AddProfileDialog(QDialog):
         self.browser = QComboBox()
         self.browser.addItem(self.bname)     # the browser saved in Settings
         self.browser.setEnabled(False)
-        self.browser.setMinimumHeight(40)
+        self.browser.setMinimumHeight(32)
         self.browser.setToolTip(exe or "Settings mein Browser EXE Path set nahi; Google Chrome ka apna profile banega")
         bcol.addWidget(self.browser)
         bc.addLayout(bcol, 3)
@@ -194,8 +225,8 @@ class AddProfileDialog(QDialog):
         self.plus = QPushButton("+")
         self.count = QLineEdit("2")
         self.count.setAlignment(Qt.AlignCenter)
-        self.count.setFixedWidth(80)
-        self.count.setMinimumHeight(38)
+        self.count.setFixedWidth(56)
+        self.count.setMinimumHeight(30)
         for b in (self.minus, self.plus):
             b.setObjectName("cnt")
             b.setCursor(Qt.PointingHandCursor)
@@ -255,7 +286,7 @@ class AddProfileDialog(QDialog):
         form.addWidget(self.l_paste_hint)
         self.paste = QPlainTextEdit()
         self.paste.setPlaceholderText("test1@example.com|password\ntest2@example.com|password")
-        self.paste.setMinimumHeight(130)
+        self.paste.setMinimumHeight(96)
         self.paste.setAccessibleName("Paste accounts")
         self.paste.textChanged.connect(self._on_paste)
         form.addWidget(self.paste)
@@ -273,26 +304,20 @@ class AddProfileDialog(QDialog):
         self.l_manual = label("Manual: har profile mein Hark ka sign-in page khul jayega, login aap khud karenge.", wrap=True, color=MUTED)
         form.addWidget(self.l_manual)
 
-        self.plist_box = QScrollArea()
-        self.plist_box.setWidgetResizable(True)
-        self.plist_box.setMinimumHeight(260)
-        self.plist_box.setStyleSheet("QScrollArea{border:none;background:transparent}")
-        pw_ = QWidget()
-        self.plist = QVBoxLayout(pw_)
-        self.plist.setContentsMargins(0, 0, 0, 0)
-        self.plist.setSpacing(8)
-        self.plist.addStretch(1)
-        self.plist_box.setWidget(pw_)
-        self.plist_box.setVisible(False)
-        form.addWidget(self.plist_box, 1)
         form.addStretch(1)
-        body.addLayout(form, 3)
+        fscroll = QScrollArea()
+        fscroll.setWidgetResizable(True)
+        fscroll.setFrameShape(QFrame.NoFrame)
+        fscroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        fscroll.setStyleSheet("QScrollArea{background:transparent;border:none}")
+        fscroll.setWidget(self.form_w)
+        body.addWidget(fscroll, 3)
 
         steps = QFrame()
         steps.setObjectName("steps")
         sv = QVBoxLayout(steps)
-        sv.setContentsMargins(20, 14, 20, 16)
-        self.steps_title = label("Setup order", size=20, bold=True)
+        sv.setContentsMargins(14, 10, 14, 10)
+        self.steps_title = label("Setup order", size=15, bold=True)
         sv.addWidget(self.steps_title)
         sl = QFrame()
         sl.setFixedHeight(1)
@@ -306,9 +331,40 @@ class AddProfileDialog(QDialog):
         for r in self.rows:
             sv.addWidget(r)
         sv.addStretch(1)
-        steps.setMinimumWidth(300)
-        steps.setMaximumWidth(340)
-        body.addWidget(steps, 2, Qt.AlignTop)
+        self.steps = steps
+        side = QVBoxLayout()
+        side.setSpacing(0)
+        side.addWidget(steps, 0, Qt.AlignTop)
+
+        # compact live progress panel, shown in place of "Setup order" once jobs start
+        self.prog = QFrame()
+        self.prog.setObjectName("steps")
+        pv = QVBoxLayout(self.prog)
+        pv.setContentsMargins(10, 10, 10, 10)
+        pv.setSpacing(6)
+        self.prog_title = label("Progress", size=15, bold=True)
+        self.prog_title.setAccessibleName("Progress")
+        pv.addWidget(self.prog_title)
+        self.plist_box = QScrollArea()
+        self.plist_box.setWidgetResizable(True)
+        self.plist_box.setFrameShape(QFrame.NoFrame)
+        self.plist_box.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.plist_box.setStyleSheet("QScrollArea{border:none;background:transparent}")
+        pw_ = QWidget()
+        pw_.setStyleSheet("background:transparent")
+        self.plist = QVBoxLayout(pw_)
+        self.plist.setContentsMargins(0, 0, 0, 0)
+        self.plist.setSpacing(6)
+        self.plist.addStretch(1)
+        self.plist_box.setWidget(pw_)
+        pv.addWidget(self.plist_box, 1)
+        self.prog.setVisible(False)
+        side.addWidget(self.prog, 1)
+        sidew = QWidget()
+        sidew.setLayout(side)
+        sidew.setMinimumWidth(240)
+        sidew.setMaximumWidth(290)
+        body.addWidget(sidew, 2)
         root.addLayout(body, 1)
 
         self.msg = label("", wrap=True)
@@ -319,13 +375,19 @@ class AddProfileDialog(QDialog):
         root.addWidget(line2)
         bh = QHBoxLayout()
         bh.addStretch(1)
+        self.hideb = button("Hide", "plain")
+        self.hideb.setMinimumHeight(38)
+        self.hideb.setToolTip("Window chhupa dein; setup background mein chalta rahega. Add profile se wapas khulegi.")
+        self.hideb.clicked.connect(self.hide)
+        self.hideb.setVisible(False)
         self.cancel = button("Cancel", "plain")
-        self.cancel.setMinimumHeight(46)
+        self.cancel.setMinimumHeight(38)
         self.cancel.clicked.connect(self.reject)
         self.create = button("Create profile", "primary")
-        self.create.setMinimumHeight(46)
-        self.create.setStyleSheet("font-size:17px;padding:8px 26px")
+        self.create.setMinimumHeight(38)
+        self.create.setStyleSheet("font-size:15px;padding:6px 20px")
         self.create.clicked.connect(self.go)
+        bh.addWidget(self.hideb)
         bh.addWidget(self.cancel)
         bh.addWidget(self.create)
         root.addLayout(bh)
@@ -439,7 +501,7 @@ class AddProfileDialog(QDialog):
             return
         ok = n >= 1 and len(good) == n and bad == 0
         if ok:
-            self.ready.setText(f"✓  {n} accounts ready")
+            self.ready.setText(f"✓  {n} account{'s' if n != 1 else ''} ready")
             self.ready.setStyleSheet(f"color:{GREEN};font-size:15px;font-weight:700")
         else:
             why = []
@@ -478,35 +540,23 @@ class AddProfileDialog(QDialog):
         if auto and (not self.email.text().strip() or not self.pw.text()):
             self.msg.setText("Auto sign-in ke liye email aur password dono chahiye.")
             return
-        self.rows[0].set_state("run", "Data folder ban raha hai…")
-        try:
-            r = self.ctl.add_profile(name, launch=not self.managed)
-        except Exception as e:
-            self.rows[0].set_state("fail", str(e))
-            self.msg.setText(f"Profile nahi ban saka: {e}")
-            return
-        self.page.rebuild()
-        if r["kind"] != "managed":
+        if not self.managed:
+            # plain Google Chrome profile: Chrome makes it, the user signs in there
+            try:
+                r = self.ctl.add_profile(name, launch=True)
+            except Exception as e:
+                self.msg.setText(f"Profile nahi ban saka: {e}")
+                return
+            self.page.rebuild()
             self.pw.clear()
             QMessageBox.information(self, "Add profile", f"Chrome mein naya profile ({r['dir']}) khul raha hai. Wahan Hark mein sign in kar lein; ye list mein khud aa jayega.")
             return self.accept()
-        self.rows[0].set_state("ok", "Profile ban gaya")
-        p = self.ctl.profile("hbm:" + r["tag"])
-        email, pw = self.email.text(), self.pw.text()
-        self.pw.clear()           # the dialog keeps no copy; the worker drops its copy after typing it
-        for w in (self.name, self.email, self.pw, self.b_auto, self.b_manual, self.t_single, self.t_multi):
-            w.setEnabled(False)
-        self.running = True
-        self.setup = ProfileSetup(self.ctl, p, "auto" if auto else "manual", email, pw, self._save_dob())
-        del pw
-        self.setup.step.connect(lambda n, st, t: self.rows[n].set_state(st, t))
-        self.setup.field.connect(self.on_field)
-        self.setup.finished.connect(self.on_done)
-        self.create.setEnabled(False)
-        self.create.setText("Setting up…")
-        self.cancel.setText("Stop")
-        self.msg.setText(f"Data folder: {r['dir']}")
-        self.setup.start()
+        email = self.email.text().strip() if auto else ""
+        if auto:
+            self._pws = {email.lower(): self.pw.text()}
+        self.pw.clear()           # the window keeps no copy on screen; the worker drops its copy after typing it
+        taken = {p.name.lower() for p in self.ctl.profiles}
+        self._start_jobs([(self.unique_name(name, taken), email)], auto)
 
     def go_multi(self):
         auto = self.auto()
@@ -518,32 +568,49 @@ class AddProfileDialog(QDialog):
         else:
             emails = [""] * n
         taken = {p.name.lower() for p in self.ctl.profiles}
-        self.queue = []
+        start = len(self.ctl.settings["managed_profiles"] or []) + 1
+        jobs = []
         for i, em in enumerate(emails):
-            base = em.split("@")[0] if em else f"{self.bname.replace(' Browser', '')} {len(self.ctl.settings['managed_profiles'] or []) + 1 + i}"
-            nm = self.unique_name(base, taken)
-            row = ProgressRow(self, i, nm, em)
-            self.plist.insertWidget(self.plist.count() - 1, row)
-            self.queue.append({"name": nm, "email": em, "row": row})
+            base = em.split("@")[0] if em else f"{self.bname.replace(' Browser', '')} {start + i}"
+            jobs.append((self.unique_name(base, taken), em))
         self.paste.blockSignals(True)
         self.paste.clear()        # nothing left on screen; passwords stay only in _pws until each is used
         self.paste.blockSignals(False)
-        for w in (self.l_paste, self.l_paste_hint, self.paste, self.ready, self.l_manual, self.cnt_box,
-                  self.b_auto, self.b_manual, self.t_single, self.t_multi):
+        self._start_jobs(jobs, auto)
+
+    def _start_jobs(self, jobs, auto):
+        """Queue the setup jobs and switch the side panel to live progress. Work runs off the GUI thread."""
+        self.queue, self.jobs, self.results = [], [], []
+        for i, (nm, em) in enumerate(jobs):
+            row = ProgressRow(self, i, nm, em)
+            job = {"name": nm, "email": em, "row": row, "state": "queued", "setup": None}
+            row.job = job
+            self.plist.insertWidget(self.plist.count() - 1, row)
+            self.queue.append(job)
+            self.jobs.append(job)
+        self.form_w.setEnabled(False)
+        for w in (self.l_paste, self.l_paste_hint, self.paste, self.ready, self.pw, self.l_pw):
+            w.setVisible(False)      # nothing about passwords stays on screen
+        for w in (self.t_single, self.t_multi):
             w.setEnabled(False)
-        for w in (self.l_paste, self.l_paste_hint, self.paste, self.ready, self.l_manual):
-            w.setVisible(False)
-        self.plist_box.setVisible(True)
+        self.steps.setVisible(False)
+        self.prog.setVisible(True)
         self.running = True
-        self.results = []
-        self.create.setEnabled(False)
-        self.create.setText("Setting up…")
-        self.cancel.setText("Stop")
         self.mode_str = "auto" if auto else "manual"
         self.dob_val = self._save_dob()
-        self.dob.setEnabled(False)
-        self.adjustSize()
+        self.create.setEnabled(False)
+        self.create.setText("Setting up…")
+        self.cancel.setVisible(False)
+        self.hideb.setVisible(True)
+        self._progress()
         QTimer.singleShot(100, self.next_profile)
+
+    def _progress(self):
+        done = sum(1 for j in self.jobs if j["state"] in ("done", "cancelled"))
+        self.prog_title.setText(f"Progress · {done}/{len(self.jobs)}")
+        self.msg.setText("Setup background mein chal raha hai. Dashboard use kar sakti hain; Hide se window chhup jayegi."
+                         if self.running else self.msg.text())
+        self.busy.emit(done, len(self.jobs)) if self.running else None
 
     def _save_dob(self):
         """Remember the batch birthday for next time (only a date, used for Hark's age check)."""
@@ -556,38 +623,68 @@ class AddProfileDialog(QDialog):
                 pass
         return v
 
+    def stop_job(self, job):
+        """Cancel only this job: a queued one is dropped, a running one stops at its next step."""
+        if not job or job["state"] in ("done", "cancelled"):
+            return
+        if job["state"] == "queued":
+            if job in self.queue:
+                self.queue.remove(job)
+            self._pws.pop(job["email"].lower(), None)
+            job["state"] = "cancelled"
+            job["row"].finish(False, "Shuru hone se pehle rok diya", cancelled=True)
+            self.results.append(None)
+            self._progress()
+            if self.running and not self.queue and not any(j["state"] == "running" for j in self.jobs):
+                self.all_done()
+            return
+        job["stopping"] = True
+        job["row"].stopb.setEnabled(False)
+        job["row"].state.setText("Rok raha hoon…")
+        if job.get("setup"):
+            job["setup"].stop()
+
     def next_profile(self):
         if not self.running:
             return
         if not self.queue:
             return self.all_done()
         job = self.queue.pop(0)
+        job["state"] = "running"
         self.cur = job
         row = job["row"]
         row.set(1, "run", "Data folder ban raha hai…")
         try:
             r = self.ctl.add_profile(job["name"], launch=False)
         except Exception as e:
+            job["state"] = "done"
             row.finish(False, f"Profile nahi bana: {e}")
             self._pws.pop(job["email"].lower(), None)
             self.results.append(False)
+            self._progress()
             return QTimer.singleShot(100, self.next_profile)
         self.page.rebuild()
         p = self.ctl.profile("hbm:" + r["tag"])
         row.p = p
         row.set(1, "ok", "Profile ban gaya")
         pw = self._pws.pop(job["email"].lower(), "") if job["email"] else ""
-        self.setup = ProfileSetup(self.ctl, p, self.mode_str, job["email"], pw, self.dob_val)
+        st = ProfileSetup(self.ctl, p, self.mode_str, job["email"], pw, self.dob_val)
         del pw
-        self.setup.step.connect(lambda n, st, t, row=row: row.set(n + 1, st, t))
-        self.setup.field.connect(self.on_field)
-        self.setup.finished.connect(lambda ok, m, row=row: self.one_done(row, ok, m))
-        self.setup.start()
+        job["setup"] = st
+        st.step.connect(lambda n, stt, t, row=row: row.set(n + 1, stt, t))
+        st.field.connect(self.on_field)
+        st.finished.connect(lambda ok, m, job=job: self.one_done(job, ok, m))
+        self.setup = st
+        st.start()
 
-    def one_done(self, row, ok, msg):
-        row.finish(ok, msg)
-        self.results.append(ok)
+    def one_done(self, job, ok, msg):
+        cancelled = bool(job.get("stopping")) and not ok
+        job["state"] = "cancelled" if cancelled else "done"
+        job["row"].finish(ok, msg, cancelled=cancelled)
+        job["setup"] = None
+        self.results.append(None if cancelled else ok)
         self.setup = None
+        self._progress()
         self.ctl.refresh_windows()
         QTimer.singleShot(800, self.next_profile)
 
@@ -595,36 +692,47 @@ class AddProfileDialog(QDialog):
         self.running = False
         self.finished_all = True
         self._pws = {}
-        n_ok = sum(1 for r in self.results if r)
+        real = [r for r in self.results if r is not None]
+        n_ok = sum(1 for r in real if r)
+        stopped = len(self.results) - len(real)
         self.create.setEnabled(True)
         self.create.setText("Done")
-        self.cancel.setVisible(False)
-        ok = n_ok == len(self.results)
-        self.msg.setText(f"{n_ok}/{len(self.results)} profiles tayyar")
-        self.msg.setStyleSheet(f"color:{GREEN if ok else '#C62828'};font-weight:700")
+        self.hideb.setVisible(False)
+        ok = bool(real) and n_ok == len(real)
+        self.prog_title.setText(f"Progress · {len(self.results)}/{len(self.jobs)}")
+        self.msg.setText(f"{n_ok}/{len(self.jobs)} profiles tayyar" + (f" · {stopped} roke gaye" if stopped else ""))
+        col = GREEN if ok else (MUTED if not real else "#C62828")
+        self.msg.setStyleSheet(f"color:{col};font-weight:700")
+        self.busy.emit(-2, len(self.jobs))
+        self.page.rebuild()
 
     def on_field(self, tag, key, value):
         self.ctl.set_managed_field(tag, key, value)
         self.ctl.reload_profiles()
 
-    def on_done(self, ok, msg):
-        self.running = False
-        self.finished_all = True
-        self.create.setEnabled(True)
-        self.create.setText("Done" if ok else "Close")
-        self.cancel.setVisible(False)
-        self.msg.setText(("✓ " if ok else "") + msg)
-        self.msg.setStyleSheet(f"color:{GREEN if ok else '#C62828'};font-weight:600")
-        self.ctl.refresh_windows()
+    def _cleanup(self):
+        if getattr(self, "_gone", False):
+            return
+        self._gone = True
+        self._pws = {}
+        self.busy.emit(-1, -1)
 
     def reject(self):
-        self.running = False
-        self.queue = []
-        self._pws = {}
-        if self.setup:
-            self.setup.stop()
-        super().reject()
+        # Esc / Cancel / title-bar X: while jobs run, only hide (they keep going); otherwise close for good
+        if self.running:
+            self.hide()
+            return
+        self._cleanup()
+        super().reject()          # done(): hides and, with WA_DeleteOnClose, deletes the window
 
     def accept(self):
-        self._pws = {}
+        self._cleanup()
         super().accept()
+
+    def closeEvent(self, e):
+        if self.running:          # closing the window never kills running setups; it just hides
+            e.ignore()
+            self.hide()
+            return
+        self._cleanup()
+        super().closeEvent(e)

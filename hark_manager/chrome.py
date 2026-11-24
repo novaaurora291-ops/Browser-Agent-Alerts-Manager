@@ -136,7 +136,13 @@ def launch_managed(p, exe, url=None, new_window=False, ext_dir=None, extra=None)
     if url:
         args.append(url)
     DETACHED = 0x00000008 | 0x00000200
-    subprocess.Popen(args, creationflags=DETACHED, close_fds=True)
+    si = None
+    if any(a.startswith("--remote-debugging-port=") for a in (extra or [])):
+        # background setup launch: open the window without taking focus from the dashboard
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 4            # SW_SHOWNOACTIVATE
+    subprocess.Popen(args, creationflags=DETACHED, close_fds=True, startupinfo=si)
     log(f"launch managed {p.tag} via {os.path.basename(os.path.dirname(os.path.dirname(exe)))} -> {p.data_dir}")
 
 
