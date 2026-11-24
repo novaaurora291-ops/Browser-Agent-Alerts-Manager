@@ -32,8 +32,10 @@ class AlertStore:
                 return a
         return None
 
+    only = None    # profile dirs shown (Cent profiles); alerts of anything else (old Chrome profiles) are kept but hidden
+
     def open_alerts(self):
-        return [a for a in self.alerts if a["status"] == "needs_reply"]
+        return [a for a in self.alerts if a["status"] == "needs_reply" and (self.only is None or a["profile_dir"] in self.only)]
 
     def add(self, qid, profile_dir, profile_name, email, question, conv_url, conv_title):
         """Returns the new alert, or None when this exact question was already alerted (no duplicates)."""

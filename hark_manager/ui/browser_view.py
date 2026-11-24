@@ -2,11 +2,12 @@
 
 Nothing is copied: the real Chrome / Cent window of that profile (its own process, data folder and signed-in
 session) is re-parented into this view, so you read, scroll and reply in the live Hark chat right here.
-Back to profiles gives the window back to the desktop exactly where it was."""
+Back to profiles only shows the dashboard: the window stays docked (hidden) inside the Manager and keeps
+running, with no desktop window and no taskbar button."""
 import time
 
 from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame
 
 from .widgets import label, button, StatusLabel
 from . import icons
@@ -40,7 +41,7 @@ class BrowserView(QWidget):
         self.ctl = ctl
         self.dir = None
         self.hwnd = None
-        self.state = None
+        self.dock = None          # set by the main window
         self.prefer = ""
         self.deadline = 0
         self.expanded = False
@@ -105,7 +106,10 @@ class BrowserView(QWidget):
         QTimer.singleShot(0, self.poll)
 
     def find_window(self, p):
-        wins = [w for w in chrome.windows_for(p) if chrome.is_window(w[0])]
+        h = self.dock.window_of(p.directory, "park") if self.dock else None
+        if h:
+            return h            # already docked in the Manager
+        wins = [w for w in chrome.windows_for(p) if chrome.is_window(w[0]) and not (self.dock and self.dock.has(w[0]))]
         if not wins:
             return None
         if self.prefer:
@@ -115,28 +119,22 @@ class BrowserView(QWidget):
         return wins[0][0]
 
     def attach(self, hwnd):
-        try:
-            self.state = chrome.embed(hwnd, int(self.host.winId()))
-        except Exception as e:
-            log(f"embed {hwnd}: {e}")
-            self.msg.setText(f"Window embed nahi hui: {e}")
+        if not self.dock.dock(self.dir, hwnd, int(self.host.winId()), "view"):
+            self.msg.setText("Window dock nahi hui; wo apni jagah desktop par wapas hai.")
+            self.tick.stop()
             return
         self.hwnd = hwnd
-        self.ctl.embedded[self.dir] = hwnd
         self.msg.hide()
         self.fit()
         log(f"embedded {self.dir} hwnd={hwnd}")
 
     def release(self):
+        """Leave the view: the window stays docked and running, parked out of sight inside the Manager."""
         if self.hwnd:
-            chrome.unembed(self.hwnd, self.state or {})
-            log(f"released {self.dir} hwnd={self.hwnd}")
-        if self.dir:
-            self.ctl.embedded.pop(self.dir, None)
+            self.dock.park_window(self.hwnd)
+            log(f"parked {self.dir} hwnd={self.hwnd} (still running, docked)")
         self.hwnd = None
-        self.state = None
         self.tick.stop()
-        QTimer.singleShot(300, self.ctl.refresh_windows)
 
     def go_back(self):
         if self.expanded:
@@ -177,8 +175,8 @@ class BrowserView(QWidget):
         if self.hwnd:
             if not chrome.is_window(self.hwnd):
                 # the user closed the browser window from inside the view
+                self.dock.forget(self.hwnd)
                 self.hwnd = None
-                self.ctl.embedded.pop(self.dir, None)
                 self.msg.setText("Browser window band ho gayi.")
                 self.msg.show()
                 self.tick.stop()

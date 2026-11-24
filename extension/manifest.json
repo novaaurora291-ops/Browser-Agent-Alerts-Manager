@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Hark Browser Manager Bridge",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "description": "Tells Hark Browser Manager (on this PC) when a Hark agent is waiting for your reply, and lets it open the right Hark tab.",
   "permissions": [
     "tabs",

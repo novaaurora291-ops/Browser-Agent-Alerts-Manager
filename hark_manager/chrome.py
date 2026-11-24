@@ -1,4 +1,9 @@
-"""Chrome profiles on this PC: discovery, windows (by AppUserModelID), launch, focus and live previews."""
+"""Cent Browser profiles managed by this tool: Cent exe, windows (matched by full exe path + user-data-dir),
+launch, focus, live previews, docking (SetParent) and taskbar buttons.
+
+Only Cent Browser is supported. Google Chrome, Edge and Brave are never scanned, launched or touched: a window
+counts as ours only when its process runs the configured Cent chrome.exe (full path) with one of our profiles'
+--user-data-dir folders, so a personal Chrome window (also chrome.exe) is never matched."""
 import json
 import os
 import subprocess
@@ -7,24 +12,23 @@ from ctypes import wintypes
 
 from .config import log
 
-USER_DATA = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "User Data")
-CHROME_CANDIDATES = [
-    os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), r"Google\Chrome\Application\chrome.exe"),
-    os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), r"Google\Chrome\Application\chrome.exe"),
-    os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Google\Chrome\Application\chrome.exe"),
-]
-
 user32 = ctypes.windll.user32
 
+CENT_EXE = ""      # the configured Cent chrome.exe (set by the controller); windows of any other exe are ignored
 
-def chrome_exe():
-    for c in CHROME_CANDIDATES:
-        if os.path.exists(c):
-            return c
-    return "chrome.exe"
+
+def set_cent_exe(exe):
+    global CENT_EXE
+    CENT_EXE = norm_path(exe) if exe else ""
+
+
+def norm_path(p):
+    return os.path.normcase(os.path.abspath(p)) if p else ""
 
 
 class Profile:
+    """A Cent Browser profile with its own --user-data-dir folder."""
+
     def __init__(self, directory, name, email="", gaia="", avatar=""):
         self.directory = directory
         self.chrome_name = name
@@ -32,57 +36,22 @@ class Profile:
         self.gaia = gaia
         self.avatar = avatar
         self.alias = ""
-        self.kind = "chrome"      # "chrome" = a profile inside Google Chrome's own User Data; "managed" = own user-data-dir
+        self.kind = "managed"
         self.data_dir = ""
         self.exe = ""
         self.tag = ""
 
     @property
     def managed(self):
-        return self.kind == "managed"
+        return True
 
     @property
     def browser_name(self):
-        return browser_name(self.exe) if self.managed else "Google Chrome"
+        return "Cent Browser"
 
     @property
     def name(self):
         return self.alias or self.chrome_name or self.directory
-
-    @property
-    def aumids(self):
-        if self.managed:
-            return set()
-        d = self.directory.replace(" ", "")
-        ids = {f"Chrome.UserData.{d}"}
-        if self.directory == "Default":
-            ids |= {"Chrome", "Chrome.UserData"}
-        return ids
-
-
-def load_profiles():
-    """Read every profile Chrome knows about from Local State (names, signed-in emails)."""
-    out = []
-    try:
-        with open(os.path.join(USER_DATA, "Local State"), encoding="utf-8") as f:
-            ls = json.load(f)
-        cache = ls.get("profile", {}).get("info_cache", {})
-        order = ls.get("profile", {}).get("profiles_order", []) or list(cache)
-        for d in order + [k for k in cache if k not in order]:
-            v = cache.get(d)
-            if not v or not os.path.isdir(os.path.join(USER_DATA, d)):
-                continue
-            out.append(Profile(d, v.get("name", d), v.get("user_name", ""), v.get("gaia_name", ""), v.get("avatar_icon", "")))
-    except Exception as e:
-        log(f"load_profiles: {e}")
-    return out
-
-
-def next_profile_dir():
-    n = 1
-    while os.path.exists(os.path.join(USER_DATA, f"Profile {n}")):
-        n += 1
-    return f"Profile {n}"
 
 
 # ---------------- managed profiles (own --user-data-dir, any Chromium browser such as Cent Browser) ----------------
@@ -100,6 +69,13 @@ def browser_name(exe):
     except Exception:
         pass
     return os.path.splitext(os.path.basename(exe))[0]
+
+
+def is_cent_exe(exe):
+    """A Cent Browser chrome.exe (product name or its install folder says Cent)."""
+    if not exe or not os.path.isfile(exe) or not exe.lower().endswith(".exe"):
+        return False
+    return "cent" in browser_name(exe).lower() or "centbrowser" in norm_path(exe).replace(" ", "")
 
 
 def detect_cent():
@@ -122,13 +98,88 @@ def managed_email(data_dir):
         return ""
 
 
+def _profile_running(data_dir):
+    """True while any browser process runs with this --user-data-dir (it would overwrite the name on exit)."""
+    want = norm_dir(data_dir)
+    try:
+        import psutil
+        for pr in psutil.process_iter(["name", "cmdline"]):
+            try:
+                if (pr.info["name"] or "").lower() != "chrome.exe":
+                    continue
+                for a in pr.info["cmdline"] or []:
+                    if a.startswith("--user-data-dir=") and norm_dir(a.split("=", 1)[1].strip('"')) == want:
+                        return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def _rw_json(path, fn):
+    """Read a JSON file (missing = {}), let fn change it, write it back atomically when it changed."""
+    data = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    before = json.dumps(data, sort_keys=True)
+    fn(data)
+    if json.dumps(data, sort_keys=True) == before:
+        return False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".hbm.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, separators=(",", ":"))
+    os.replace(tmp, path)
+    return True
+
+
+def set_profile_name(data_dir, name):
+    """Make `name` Cent Browser's own profile name for this user-data-dir (avatar menu, window title, profile
+    picker). Written to Local State (info_cache) and Default/Preferences while the browser is closed, so the
+    first launch and every reopen show it. Returns True when something was written."""
+    name = (name or "").strip()
+    if not data_dir or not name:
+        return False
+    if _profile_running(data_dir):
+        log(f"profile name '{name}': Cent is running for {data_dir}, will set it at the next launch")
+        return False
+
+    def local_state(d):
+        prof = d.setdefault("profile", {})
+        ent = prof.setdefault("info_cache", {}).setdefault("Default", {})
+        ent["name"] = name
+        ent["shortcut_name"] = name
+        ent["is_using_default_name"] = False
+        prof.setdefault("last_used", "Default")
+        if "Default" not in (prof.get("last_active_profiles") or []):
+            prof["last_active_profiles"] = ["Default"]
+
+    def prefs(d):
+        prof = d.setdefault("profile", {})
+        prof["name"] = name
+        prof["using_default_name"] = False
+
+    a = _rw_json(os.path.join(data_dir, "Local State"), local_state)
+    b = _rw_json(os.path.join(data_dir, "Default", "Preferences"), prefs)
+    if a or b:
+        log(f"profile name set to '{name}' in {data_dir}")
+    return a or b
+
+
 def norm_dir(d):
     return os.path.normcase(os.path.abspath(d)).rstrip("\\/") if d else ""
 
 
-def launch_managed(p, exe, url=None, new_window=False, ext_dir=None, extra=None):
+def launch_managed(p, exe, url=None, new_window=False, ext_dir=None, extra=None, minimized=False):
     os.makedirs(p.data_dir, exist_ok=True)
     args = [exe, f"--user-data-dir={p.data_dir}", "--no-first-run", "--no-default-browser-check"] + list(extra or [])
+    # docked windows sit inside the Manager, often out of sight: keep them rendering and their chats live
+    for f in ("--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+              "--disable-features=CalculateNativeWinOcclusion"):
+        if f not in args:
+            args.insert(1, f)
     if ext_dir and os.path.isdir(ext_dir):
         args.append(f"--load-extension={ext_dir}")
     if new_window:
@@ -142,40 +193,54 @@ def launch_managed(p, exe, url=None, new_window=False, ext_dir=None, extra=None)
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = 4            # SW_SHOWNOACTIVATE
+    elif minimized:
+        # it is docked into the Manager right away: open it minimised and without taking focus
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 7            # SW_SHOWMINNOACTIVE
     subprocess.Popen(args, creationflags=DETACHED, close_fds=True, startupinfo=si)
     log(f"launch managed {p.tag} via {os.path.basename(os.path.dirname(os.path.dirname(exe)))} -> {p.data_dir}")
 
 
-_udd_cache = {}
+_proc_cache = {}
 
 
-def _proc_udd(pid):
-    """--user-data-dir of a browser process (cached per pid)."""
-    if pid in _udd_cache:
-        return _udd_cache[pid]
-    udd = None
+def _proc_info(pid):
+    """(full exe path, --user-data-dir) of a browser process, both normalized (cached per pid)."""
+    if pid in _proc_cache:
+        return _proc_cache[pid]
+    info = ("", None)
     try:
         import psutil
-        for a in psutil.Process(pid).cmdline():
+        pr = psutil.Process(pid)
+        udd = None
+        for a in pr.cmdline():
             if a.startswith("--user-data-dir="):
                 udd = norm_dir(a.split("=", 1)[1].strip('"'))
                 break
+        info = (norm_path(pr.exe()), udd)
     except Exception:
-        udd = None
-    if len(_udd_cache) > 500:
-        _udd_cache.clear()
-    _udd_cache[pid] = udd
-    return udd
+        info = ("", None)
+    if len(_proc_cache) > 500:
+        _proc_cache.clear()
+    _proc_cache[pid] = info
+    return info
 
 
-def managed_windows(dirs):
-    """Visible top-level browser windows whose process runs with one of our --user-data-dir folders.
-    Returns {normalized dir: [(hwnd, title, "", minimized)]}."""
+def _proc_udd(pid):
+    return _proc_info(pid)[1]
+
+
+def managed_windows(dirs, exe=None):
+    """Visible top-level Cent windows whose process is the configured Cent exe (full path) running with one of
+    our --user-data-dir folders. Anything else (personal Chrome, Edge, Brave, Cent's own default profile) is
+    never listed. Returns {normalized dir: [(hwnd, title, "", minimized)]}."""
     import win32gui
     import win32process
     want = {norm_dir(d) for d in dirs if d}
+    exe = norm_path(exe) if exe else CENT_EXE
     out = {}
-    if not want:
+    if not want or not exe:
         return out
 
     def cb(h, _):
@@ -188,8 +253,8 @@ def managed_windows(dirs):
             if not title:
                 return True
             _, pid = win32process.GetWindowThreadProcessId(h)
-            udd = _proc_udd(pid)
-            if udd in want:
+            pexe, udd = _proc_info(pid)
+            if udd in want and pexe == exe:
                 out.setdefault(udd, []).append((h, title, "", bool(win32gui.IsIconic(h))))
         except Exception:
             pass
@@ -199,58 +264,21 @@ def managed_windows(dirs):
     return out
 
 
-def launch(profile_dir, url=None, new_window=False, more_urls=None):
-    args = [chrome_exe(), f"--profile-directory={profile_dir}"]
-    if new_window:
-        args.append("--new-window")
-    if url:
-        args.append(url)
-    args += list(more_urls or [])
-    DETACHED = 0x00000008 | 0x00000200
-    subprocess.Popen(args, creationflags=DETACHED, close_fds=True)
+def window_profile_ok(hwnd, data_dir, exe=None):
+    """Re-check one window right before docking it: Cent exe path and the profile's user-data-dir."""
+    try:
+        import win32process
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        pexe, udd = _proc_info(pid)
+        return pexe == (norm_path(exe) if exe else CENT_EXE) and udd == norm_dir(data_dir)
+    except Exception:
+        return False
 
 
 # ---------------- windows ----------------
-def _aumid(hwnd):
-    try:
-        from win32com.propsys import propsys, pscon
-        ps = propsys.SHGetPropertyStoreForWindow(hwnd, propsys.IID_IPropertyStore)
-        v = ps.GetValue(pscon.PKEY_AppUserModel_ID).GetValue()
-        return v or ""
-    except Exception:
-        return ""
-
-
-def chrome_windows():
-    """All visible top-level Chrome browser windows in z-order: [(hwnd, title, aumid, minimized)]."""
-    import win32gui
-    res = []
-
-    def cb(h, _):
-        try:
-            if not win32gui.IsWindowVisible(h) or win32gui.GetClassName(h) != "Chrome_WidgetWin_1":
-                return True
-            title = win32gui.GetWindowText(h)
-            if not title or not title.endswith("Google Chrome"):
-                return True
-            a = _aumid(h)
-            if a:
-                res.append((h, title, a, bool(win32gui.IsIconic(h))))
-        except Exception:
-            pass
-        return True
-
-    win32gui.EnumWindows(cb, None)
-    return res
-
-
 def windows_for(profile, wins=None, mwins=None):
-    if profile.managed:
-        mwins = managed_windows([profile.data_dir]) if mwins is None else mwins
-        return mwins.get(norm_dir(profile.data_dir), [])
-    wins = chrome_windows() if wins is None else wins
-    ids = profile.aumids
-    return [w for w in wins if w[2] in ids]
+    mwins = managed_windows([profile.data_dir]) if mwins is None else mwins
+    return mwins.get(norm_dir(profile.data_dir), [])
 
 
 def focus_hwnd(hwnd):
@@ -296,8 +324,8 @@ def capture(hwnd, max_w=520, max_h=330):
     from PIL import Image
     import io
     try:
-        if win32gui.IsIconic(hwnd):
-            return None
+        if win32gui.IsIconic(hwnd) or not win32gui.IsWindowVisible(hwnd):
+            return None           # docked out of sight (parked): it would print what lies on top of it; keep the last preview
         l, t, r, b = win32gui.GetWindowRect(hwnd)
         w, h = r - l, b - t
         if w < 50 or h < 50:
@@ -321,6 +349,8 @@ def capture(hwnd, max_w=520, max_h=330):
         win32gui.ReleaseDC(hwnd, hdc)
         if not ok or img is None:
             return None
+        if max(hi for _, hi in img.getextrema()) < 10:
+            return None           # a docked window that is not on screen prints black: keep the last preview
         # trim the 7-8px invisible resize borders Windows 10/11 add around the window
         img = img.crop((8, 0, max(9, w - 8), max(9, h - 8)))
         img.thumbnail((max_w, max_h))
@@ -350,6 +380,50 @@ user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
 user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
 user32.SetParent.restype = wintypes.HWND
 user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
+user32.GetParent.restype = wintypes.HWND
+user32.GetParent.argtypes = [wintypes.HWND]
+
+
+# ---------- taskbar buttons (ITaskbarList, plain COM through ctypes) ----------
+class _GUID(ctypes.Structure):
+    _fields_ = [("a", ctypes.c_uint32), ("b", ctypes.c_uint16), ("c", ctypes.c_uint16), ("d", ctypes.c_ubyte * 8)]
+
+    def __init__(self, s):
+        import uuid
+        u = uuid.UUID(s)
+        super().__init__(u.time_low, u.time_mid, u.time_hi_version, (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+
+
+_tbl = None
+
+
+def _taskbar():
+    global _tbl
+    if _tbl is None:
+        ole = ctypes.windll.ole32
+        ole.CoInitialize(None)
+        ptr = ctypes.c_void_p()
+        hr = ole.CoCreateInstance(ctypes.byref(_GUID("56FDF344-FD6D-11d0-958A-006097C9A090")), None, 1,
+                                  ctypes.byref(_GUID("56FDF342-FD6D-11d0-958A-006097C9A090")), ctypes.byref(ptr))
+        if hr != 0 or not ptr.value:
+            raise OSError(f"ITaskbarList: {hr:#x}")
+        vt = ctypes.cast(ctypes.cast(ptr, ctypes.POINTER(ctypes.c_void_p))[0], ctypes.POINTER(ctypes.c_void_p))
+        proto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.HWND)
+        init = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(vt[3])
+        init(ptr)
+        _tbl = (ptr, proto(vt[4]), proto(vt[5]))      # (this, AddTab, DeleteTab)
+    return _tbl
+
+
+def taskbar_button(hwnd, show):
+    """Add or remove a window's own button on the Windows taskbar."""
+    try:
+        this, add, delete = _taskbar()
+        (add if show else delete)(this, hwnd)
+        return True
+    except Exception as e:
+        log(f"taskbar {'add' if show else 'delete'} {hwnd}: {e}")
+        return False
 
 
 def is_window(hwnd):
@@ -357,22 +431,36 @@ def is_window(hwnd):
 
 
 def embed(hwnd, parent):
-    """Re-parent a browser's own top-level window into one of our widgets. The browser keeps running as itself
-    (same process, same profile, same signed-in session); we only host its window. Returns state for unembed."""
+    """Dock a Cent window into one of our widgets (Win32 SetParent). The browser keeps running as itself (same
+    process, same profile, same signed-in session); we only host its window. While docked it has no taskbar
+    button of its own. Returns the state unembed() needs; on any failure the window is put back as it was."""
     import win32gui
     import win32con
     place = win32gui.GetWindowPlacement(hwnd)     # (flags, showCmd, minpos, maxpos, normal rect): restored on unembed
-    if win32gui.IsIconic(hwnd):
-        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-    elif place[1] == win32con.SW_SHOWMAXIMIZED:
-        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    l, t, r, b = place[4]
     st = {"style": user32.GetWindowLongPtrW(hwnd, GWL_STYLE), "ex": user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
-          "rect": win32gui.GetWindowRect(hwnd), "place": place}
-    style = (st["style"] & ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)) | WS_CHILD
-    user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style)
-    user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, st["ex"] & ~WS_EX_APPWINDOW)
-    user32.SetParent(hwnd, parent)
-    win32gui.SetWindowPos(hwnd, 0, 0, 0, 0, 0, win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED | win32con.SWP_SHOWWINDOW)
+          "rect": win32gui.GetWindowRect(hwnd) if place[1] == win32con.SW_SHOWNORMAL else (l, t, r, b), "place": place}
+    try:
+        # the browser must not think it is minimised/maximised while docked (it would paint white / ignore size)
+        if place[1] == win32con.SW_SHOWMINIMIZED or win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
+        elif place[1] == win32con.SW_SHOWMAXIMIZED:
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        # hidden while it changes owner: the shell drops its taskbar button
+        win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+        style = (st["style"] & ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
+                                 | 0x20000000 | 0x01000000)) | WS_CHILD       # no WS_MINIMIZE / WS_MAXIMIZE either
+        user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style)
+        user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, st["ex"] & ~WS_EX_APPWINDOW)
+        if not user32.SetParent(hwnd, parent) or user32.GetParent(hwnd) != parent:
+            raise OSError(f"SetParent failed ({ctypes.GetLastError()})")
+        taskbar_button(hwnd, False)
+        win32gui.SetWindowPos(hwnd, 0, 0, 0, max(200, r - l), max(150, b - t),
+                              win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED | win32con.SWP_SHOWWINDOW)
+    except Exception:
+        unembed(hwnd, st)           # docking failed: the window goes back exactly as it was, taskbar button too
+        raise
     return st
 
 
@@ -391,6 +479,7 @@ def unembed(hwnd, st):
     if not is_window(hwnd):
         return
     try:
+        win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
         user32.SetParent(hwnd, None)
         user32.SetWindowLongPtrW(hwnd, GWL_STYLE, st["style"])
         user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, st["ex"])
@@ -403,6 +492,7 @@ def unembed(hwnd, st):
             if cmd == win32con.SW_SHOWMINIMIZED:
                 cmd = win32con.SW_SHOWMINNOACTIVE
             win32gui.SetWindowPlacement(hwnd, (pl[0], cmd, pl[2], pl[3], pl[4]))
+        taskbar_button(hwnd, True)      # its own taskbar button back
     except Exception as e:
         log(f"unembed {hwnd}: {e}")
 
@@ -413,11 +503,6 @@ def window_title(hwnd):
         return win32gui.GetWindowText(hwnd)
     except Exception:
         return ""
-
-
-def pair_tag(p):
-    import re
-    return "chr_" + re.sub(r"[^A-Za-z0-9_-]", "_", p.directory)
 
 
 def _is_bridge_dir(path):
@@ -456,7 +541,7 @@ def _proc_has_bridge_flag(p):
     """True if the running browser for this profile was started with --load-extension=<bridge folder>."""
     try:
         import psutil
-        want = norm_dir(p.data_dir) if p.managed else None
+        want = norm_dir(p.data_dir)
         for pr in psutil.process_iter(["name", "cmdline"]):
             cl = pr.info.get("cmdline") or []
             if not cl or any(a.startswith("--type=") for a in cl):
@@ -475,15 +560,13 @@ def _proc_has_bridge_flag(p):
 def bridge_installed(p, running):
     """Is the Hark bridge in this profile? Unpacked (persistent) record always counts; a command-line copy
     counts only if the running browser actually carries the flag (or, closed + managed, the Manager adds it at launch)."""
-    prefs = os.path.join(p.data_dir, "Default") if p.managed else os.path.join(USER_DATA, p.directory)
+    prefs = os.path.join(p.data_dir, "Default")
     recs = [r for r in _ext_records(prefs) if r["state"] == 1]
     if any(r["location"] == 4 for r in recs):
         return True
-    if p.managed:
-        if running:
-            return _proc_has_bridge_flag(p)
-        return os.path.isfile(os.path.join(p.data_dir, "_hbm_bridge", "manifest.json"))
-    return False
+    if running:
+        return _proc_has_bridge_flag(p)
+    return os.path.isfile(os.path.join(p.data_dir, "_hbm_bridge", "manifest.json"))
 
 
 def reparent(hwnd, parent):

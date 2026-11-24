@@ -195,6 +195,7 @@ class ProfileSetup(QObject):
 
     def _run(self):
         ok, msg = False, ""
+        self.ctl.no_dock.add(self.p.directory)     # setup drives this window on the desktop; docked afterwards
         try:
             self.port = free_port()
             self.cdp = CDP(self.port)
@@ -230,6 +231,7 @@ class ProfileSetup(QObject):
             log(f"setup {self.p.tag} error: {e}")
         finally:
             self._pw = None
+            self.ctl.no_dock.discard(self.p.directory)
         self.finished.emit(ok, msg)
 
     # ---------- step 1: Browsec ----------

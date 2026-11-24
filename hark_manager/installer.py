@@ -9,17 +9,12 @@ from .config import log
 
 
 def _windows(p):
-    if p.managed:
-        return chrome.managed_windows([p.data_dir]).get(chrome.norm_dir(p.data_dir), [])
-    return chrome.windows_for(p)
+    return chrome.managed_windows([p.data_dir]).get(chrome.norm_dir(p.data_dir), [])
 
 
 def _open_extensions_page(p, exe):
     import subprocess
-    if p.managed:
-        args = [exe, f"--user-data-dir={p.data_dir}", "--no-first-run", "about:blank"]
-    else:
-        args = [chrome.chrome_exe(), f"--profile-directory={p.directory}", "about:blank"]
+    args = [exe, f"--user-data-dir={p.data_dir}", "--no-first-run", "about:blank"]
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     si.wShowWindow = 4          # SW_SHOWNOACTIVATE: do not take the user's foreground window
@@ -138,6 +133,6 @@ def _install(p, ext_dir, exe):
     err = [t for t in w.descendants(control_type="Text") if "failed to load extension" in (t.element_info.name or "").lower()]
     if err:
         return False, "Extension load fail hua"
-    log(f"bridge loaded unpacked into {p.data_dir if p.managed else p.directory} from {ext_dir}")
+    log(f"bridge loaded unpacked into {p.data_dir} from {ext_dir}")
     _close_ext_tab(w)
     return True, "Load unpacked ho gaya"

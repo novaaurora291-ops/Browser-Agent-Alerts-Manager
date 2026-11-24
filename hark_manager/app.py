@@ -24,7 +24,7 @@ def main():
     sock = QLocalSocket()
     sock.connectToServer(APP_NAME)
     if sock.waitForConnected(400):
-        sock.write(b"show")
+        sock.write(b"quit" if "--quit" in sys.argv else b"show")
         sock.flush()
         sock.waitForBytesWritten(400)
         return 0
@@ -35,7 +35,20 @@ def main():
     ensure_extension()
     ctl = Controller()
     win = MainWindow(ctl)
-    server.newConnection.connect(lambda: (server.nextPendingConnection(), win.show_normal()))
+    def on_conn():
+        c = server.nextPendingConnection()
+
+        def read():
+            # "quit" (python run.py --quit): close cleanly, every docked Cent window goes back to the desktop first
+            if bytes(c.readAll().data()).startswith(b"quit"):
+                log("quit requested by a second launch (--quit)")
+                win.quit()
+            else:
+                win.show_normal()
+        c.readyRead.connect(read)
+        if c.bytesAvailable():
+            read()
+    server.newConnection.connect(on_conn)
     if "--minimized" in sys.argv:
         win.hide()
     else:

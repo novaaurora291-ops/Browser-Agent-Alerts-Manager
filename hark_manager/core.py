@@ -2,7 +2,7 @@
 import threading
 import os
 import time
-EXT_VERSION = "1.0.14"
+EXT_VERSION = "1.0.15"
 ALERT_GRACE = 15  # an alert Hark no longer shows as waiting (live DOM) is cleared after this many seconds
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -79,6 +79,7 @@ class Controller(QObject):
         self.state = {}       # profile_dir -> {"t":..., "tabs":[...], "hark":{tabId: state}}
         self.windows = {}     # profile_dir -> [(hwnd,title,aumid,minimized)]
         self.embedded = Hosted(self)  # profile_dir -> hwnd of its browser window currently hosted inside the Manager
+        self.no_dock = set()  # profile dirs whose windows must stay on the desktop for now (setup, bridge install)
 
         self.previews = {}    # profile_dir -> png bytes
         self.tg_ok = False
@@ -106,23 +107,27 @@ class Controller(QObject):
 
     # ---------- profiles ----------
     def reload_profiles(self):
-        ps = chrome.load_profiles()
+        """Only Cent Browser profiles made by this tool, linked to the configured Cent install. Google Chrome's
+        own profiles (and Edge / Brave) are not scanned at all."""
         aliases = self.settings["aliases"] or {}
-        for p in ps:
-            p.alias = aliases.get(p.directory, "")
+        cent = self.cent_exe()
+        chrome.set_cent_exe(cent)
+        cdir = os.path.dirname(chrome.norm_path(cent)) if cent else ""
         managed = []
         for m in self.settings["managed_profiles"] or []:
+            rexe = chrome.norm_path((m.get("exe") or "").strip('"'))
+            if not cent or (rexe and os.path.dirname(rexe) != cdir):
+                continue      # made with another browser / another Cent install: not linked to this Cent
             p = chrome.Profile("hbm:" + m["id"], m.get("name") or m["id"])
             p.kind, p.tag, p.data_dir, p.exe = "managed", m["id"], m["data_dir"], m.get("exe", "")
             p.email = chrome.managed_email(p.data_dir) or m.get("email", "")
             p.alias = aliases.get(p.directory, "")
             managed.append(p)
-        self.profiles = ps + managed
-        # bridge reports: Chrome profiles are matched by their Google account, managed ones by their own tag
-        self.by_email = {p.email.lower(): p for p in ps if p.email}
+        self.profiles = managed
+        self.alerts.only = {p.directory for p in managed}
+        # bridge reports are matched by each profile's own tag only (a bridge in personal Chrome maps to nothing)
+        self.by_email = {}
         self.by_tag = {p.tag: p for p in managed}
-        for p in ps:   # a Chrome profile is paired with its bridge by a tag too (needed when it has no Google account)
-            self.by_tag[chrome.pair_tag(p)] = p
         self.changed.emit()
 
     def bridge_key(self, p):
@@ -131,24 +136,42 @@ class Controller(QObject):
         st = self.state.get(p.directory) or {}
         return st.get("tag") or (p.email or "").lower()
 
-    def browser_exe(self):
+    def cent_exe(self):
+        """The configured Cent Browser chrome.exe (Settings), else Cent found in its usual install folders.
+        Any other browser is refused: this tool works with Cent Browser only."""
         exe = (self.settings["browser_exe"] or "").strip().strip('"')
-        return exe if exe and os.path.isfile(exe) else ""
+        if exe and chrome.is_cent_exe(exe):
+            return exe
+        found = chrome.detect_cent()
+        if found and not exe:
+            self.settings["browser_exe"] = found
+            self.settings.save()
+        return found if found and not exe else ""
+
+    browser_exe = cent_exe
 
     def exe_for(self, p):
-        """A managed profile keeps the browser it was made with; if that exe is gone, the current Settings browser."""
-        if p.exe and os.path.isfile(p.exe):
-            return p.exe
-        return self.browser_exe() or chrome.chrome_exe()
+        """Every profile runs on the configured Cent exe (the one its windows are matched against)."""
+        return self.cent_exe()
 
     def open_in(self, p, url=None, new_window=False, extra=None):
-        if p.managed:
-            m = self._managed_rec(p.tag) or {}
-            if not m.get("tagged") and not url:
-                url = "https://hark.com/"
-            chrome.launch_managed(p, self.exe_for(p), url, new_window, config.ensure_profile_extension(p.data_dir, p.tag), extra)
-        else:
-            chrome.launch(p.directory, url, new_window)
+        exe = self.cent_exe()
+        if not exe:
+            log(f"open {p.directory}: Cent Browser path not set, nothing launched")
+            return False
+        # the name given in Add profile / Rename is Cent's own profile name (avatar menu), set while Cent is closed
+        if not self.windows.get(p.directory) and p.directory not in self.embedded:
+            try:
+                chrome.set_profile_name(p.data_dir, p.name)
+            except Exception as e:
+                log(f"profile name {p.directory}: {e}")
+        m = self._managed_rec(p.tag) or {}
+        if not m.get("tagged") and not url:
+            url = "https://hark.com/"
+        dock = bool(self.settings["keep_docked"]) and p.directory not in self.no_dock
+        chrome.launch_managed(p, exe, url, new_window, config.ensure_profile_extension(p.data_dir, p.tag), extra,
+                              minimized=dock)
+        return True
 
     def _managed_rec(self, tag):
         for m in self.settings["managed_profiles"] or []:
@@ -176,7 +199,7 @@ class Controller(QObject):
         # RUNNING wins: if Hark shows a running task in this profile (live pill, Stop button, Working badge,
         # "Waiting for your task to finish", or the user's message is last) the profile is Working.
         if self.is_working(p):
-            return "Working"
+            return "Running"
         if any(a["profile_dir"] == p.directory for a in self.alerts.open_alerts()):
             return "Needs reply"
         if not self.windows.get(p.directory):
@@ -186,17 +209,14 @@ class Controller(QObject):
     def pair_bridge(self, p):
         """Tell this profile's bridge which profile it is: open the Manager's local tag page in that profile;
         the bridge stores the tag, reports, and closes the tab itself."""
-        url = f"http://127.0.0.1:{config.BRIDGE_PORT}/hbm-tag?p={chrome.pair_tag(p) if not p.managed else p.tag}&close=1"
+        url = f"http://127.0.0.1:{config.BRIDGE_PORT}/hbm-tag?p={p.tag}&close=1"
         log(f"pairing bridge in {p.directory}")
         self.state.setdefault(p.directory, {"t": 0, "tabs": [], "hark": {}, "email": ""})["checking"] = time.time()
-        if p.managed:
-            self.open_in(p, url)
-        else:
-            chrome.launch(p.directory, url)
+        self.open_in(p, url)
 
     def reload_bridge(self, p):
         try:
-            config.ensure_profile_extension(p.data_dir, p.tag) if p.managed else config.ensure_extension()
+            config.ensure_profile_extension(p.data_dir, p.tag)
         except Exception as e:
             log(f"bridge files update {p.directory}: {e}")
         st = self.state.setdefault(p.directory, {"t": 0, "tabs": [], "hark": {}, "email": ""})
@@ -256,17 +276,17 @@ class Controller(QObject):
         # Windows destroys a browser window together with the app hosting it, so the browser's own
         # "recently closed" list does not have it: open it again with the tabs it had (saved while hosted).
         tabs = data.get("tabs") or {}
-        log(f"last run ended while hosting {len(dirs)} browser window(s): reopening them with their tabs")
-        self.embedded._save()
         self.refresh_windows()
+        log(f"last run ended while hosting {len(dirs)} browser window(s): reopening the ones that were closed with it")
+        self.embedded._save()
         for d in dirs:
             p = self.profile(d)
+            if self.windows.get(d) or d in self.embedded:
+                log(f"restore {d}: its window is still running, nothing reopened")
+                continue        # the window survived (the Manager was not hosting it any more): no duplicate
             urls = tabs.get(d) or ["https://hark.com/chat"]
             log(f"restore {d}: {len(urls)} tab(s)")
-            if p.managed:
-                self.open_in(p, urls[0], new_window=bool(self.windows.get(d)), extra=urls[1:])
-            else:
-                chrome.launch(p.directory, urls[0], new_window=bool(self.windows.get(d)), more_urls=urls[1:])
+            self.open_in(p, urls[0], new_window=bool(self.windows.get(d)), extra=urls[1:])
         QTimer.singleShot(2500, self.refresh_windows)
 
     def vpn_check(self, p):
@@ -278,16 +298,11 @@ class Controller(QObject):
 
     def refresh_windows(self):
         try:
-            wins = chrome.chrome_windows()
+            mwins = chrome.managed_windows([p.data_dir for p in self.profiles])
         except Exception as e:
-            log(f"windows: {e}")
-            return
-        try:
-            mwins = chrome.managed_windows([p.data_dir for p in self.profiles if p.managed])
-        except Exception as e:
-            log(f"managed windows: {e}")
+            log(f"cent windows: {e}")
             mwins = {}
-        new = {p.directory: chrome.windows_for(p, wins, mwins) for p in self.profiles}
+        new = {p.directory: chrome.windows_for(p, None, mwins) for p in self.profiles}
         # a window hosted inside the Manager is a child window now, so EnumWindows no longer lists it
         for d, h in list(self.embedded.items()):
             if chrome.is_window(h):
@@ -357,14 +372,14 @@ class Controller(QObject):
                 self._unmapped_logged = time.time()
                 log(f"bridge report not mapped to a profile (email={email or '-'} tag={tag or '-'}, ext {rep.get('ext_id')})")
             return False
-        if p.managed:
+        if True:
             m = self._managed_rec(p.tag)
             if m and not m.get("tagged"):
                 m["tagged"] = True
                 self.settings.save()
                 log(f"managed profile {p.tag} bridge connected")
         st = self.state.setdefault(p.directory, {"t": 0, "tabs": [], "hark": {}, "email": email})
-        st["tag"] = tag if not p.managed else st.get("tag", "")
+        st["tag"] = st.get("tag", "")
         st["ver"] = rep.get("ver") or ""
         if "vpn" in rep:
             old = (st.get("vpn") or {}).get("state"), (st.get("vpn") or {}).get("country")
@@ -386,7 +401,7 @@ class Controller(QObject):
         if rep.get("limit_result") is None and rep.get("ver") != EXT_VERSION and not checking and time.time() - st.get("reload_asked", 0) > 60:
             st["reload_asked"] = time.time()
             try:   # put the current files where this profile loads the bridge from, then let it reload itself
-                config.ensure_profile_extension(p.data_dir, p.tag) if p.managed else config.ensure_extension()
+                config.ensure_profile_extension(p.data_dir, p.tag)
             except Exception as e:
                 log(f"bridge files update {p.directory}: {e}")
             self.bridge.queue_command(self.bridge_key(p), {"type": "reload_ext"})
@@ -401,8 +416,9 @@ class Controller(QObject):
         changed = False
         if h and h.get("tabId") is not None:
             prev = st["hark"].get(h["tabId"])
+            h["_t"] = rep["_t"]
             st["hark"][h["tabId"]] = h
-            changed = prev != h
+            changed = {k: v for k, v in (prev or {}).items() if k != "_t"} != {k: v for k, v in h.items() if k != "_t"}
             kinds = lambda x: tuple(sorted({str(r).split(":")[0] for r in (x.get("workWhy") or [])}))
             sig = (h.get("working"), h.get("pending"), h.get("optional"), h.get("qid"), kinds(h))
             if not prev or sig != (prev.get("working"), prev.get("pending"), prev.get("optional"), prev.get("qid"), kinds(prev)):
@@ -580,25 +596,15 @@ class Controller(QObject):
         self.settings.save()
 
     def add_profile(self, name, launch=True):
-        """With a browser set in Settings: a new profile with its own user-data-dir in <tool>\\BrowserProfiles.
-        Without one: the old way, a new profile inside Google Chrome."""
-        exe = self.browser_exe()
+        """A new Cent Browser profile with its own user-data-dir in <tool>\\BrowserProfiles."""
+        exe = self.cent_exe()
         if not exe:
-            d = chrome.next_profile_dir()
-            if name:
-                al = dict(self.settings["aliases"] or {})
-                al[d] = name
-                self.settings["aliases"] = al
-                self.settings.save()
-            chrome.launch(d, "https://hark.com/")
-            for delay in (4000, 9000):
-                QTimer.singleShot(delay, self.reload_profiles)
-            return {"kind": "chrome", "dir": d, "browser": "Google Chrome"}
+            raise RuntimeError("Settings mein Cent Browser ki chrome.exe set karein (sirf Cent Browser supported hai)")
         import re
         import uuid
         recs = list(self.settings["managed_profiles"] or [])
         n = len(recs) + 1
-        name = name or f"{chrome.browser_name(exe)} {n}"
+        name = name or f"Cent {n}"
         pid = uuid.uuid4().hex[:6]
         slug = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-")[:32] or "Profile"
         root = config.browser_profiles_dir()
@@ -613,7 +619,7 @@ class Controller(QObject):
         if launch:
             self.open_in(self.profile("hbm:" + pid))
             QTimer.singleShot(2500, self.refresh_windows)
-        return {"kind": "managed", "tag": pid, "dir": data_dir, "browser": chrome.browser_name(exe), "name": name}
+        return {"kind": "managed", "tag": pid, "dir": data_dir, "browser": "Cent Browser", "name": name}
 
     def rename(self, p, name):
         al = dict(self.settings["aliases"] or {})
@@ -624,6 +630,58 @@ class Controller(QObject):
         self.settings["aliases"] = al
         self.settings.save()
         self.reload_profiles()
+        q = self.profile(p.directory)
+        if q and not self.windows.get(q.directory) and q.directory not in self.embedded:
+            try:      # Cent closed: write it now; otherwise it is written at the next launch
+                chrome.set_profile_name(q.data_dir, q.name)
+            except Exception as e:
+                log(f"profile name {q.directory}: {e}")
+
+    def recheck_all(self, done=None, wait_ms=6000):
+        """Refresh button: re-read the live Hark state of every Cent profile and sync cards + Needs reply.
+        Each open profile's bridge re-sends every Hark tab's state now; after the wait, tabs that did not answer
+        are dropped and open alerts whose question no tab still shows waiting are resolved."""
+        t0 = time.time()
+        self.refresh_windows()
+        asked = []
+        for p in self.profiles:
+            if self.windows.get(p.directory) or p.directory in self.embedded or self.bridge_live(p):
+                self.bridge.queue_command(self.bridge_key(p), {"type": "rescan"})
+                asked.append(p)
+        log(f"refresh: rescan asked in {len(asked)} profile(s)")
+
+        def finish():
+            self.refresh_windows()
+            now = time.time()
+            for p in self.profiles:
+                st = self.state.get(p.directory)
+                open_ = bool(self.windows.get(p.directory)) or p.directory in self.embedded
+                if not st:
+                    continue
+                if not open_:
+                    st["hark"] = {}           # browser closed: nothing can be running there
+                elif st.get("t", 0) >= t0:
+                    # the bridge answered: keep only the tabs that re-reported their state just now
+                    st["hark"] = {k: v for k, v in st["hark"].items() if v.get("_t", 0) >= t0}
+                else:
+                    continue                  # no answer: keep what we know, the normal live check handles it
+                waiting = {v.get("qid") for v in st["hark"].values()
+                           if v.get("qid") and (v.get("pending") or v.get("settling")) and not v.get("working")}
+                for a in self.alerts.open_alerts():
+                    if a["profile_dir"] == p.directory and a["qid"] not in waiting:
+                        self.alerts.resolve(a, "refresh: no longer waiting in Hark")
+                for q in waiting:
+                    self.seen[q] = now
+            counts = {}
+            for p in self.profiles:
+                s = self.status(p)
+                counts[s] = counts.get(s, 0) + 1
+            summary = ", ".join(f"{k} {counts[k]}" for k in ("Running", "Needs reply", "Idle", "Closed") if counts.get(k)) or "no profiles"
+            log(f"refresh done: {summary}")
+            self.changed.emit()
+            if done:
+                done(summary)
+        QTimer.singleShot(wait_ms, finish)
 
     def needs_reply_count(self):
         return len(self.alerts.open_alerts())

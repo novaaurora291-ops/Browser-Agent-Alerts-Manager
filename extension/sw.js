@@ -110,6 +110,16 @@ async function runCommands(cmds) {
         vpnCache.at = 0;
         await post("/report", { email: await getEmail(), tag: await getTag(), ext_id: chrome.runtime.id, ver: chrome.runtime.getManifest().version,
                                 tabs: [], windows: [], hark: null, vpn_only: true, vpn: await vpnState(true) });
+      } else if (c.type === "rescan") {
+        // Manager Refresh: every Hark tab re-sends its live state now, then a fresh tab/window report
+        const tabs = await chrome.tabs.query({ url: "https://hark.com/*" });
+        for (const t of tabs) {
+          let ok = await chrome.tabs.sendMessage(t.id, { type: "rescan" }).catch(() => null);
+          if (!ok) {   // content script missing (tab opened before the bridge loaded): inject it, it reports on load
+            try { await chrome.scripting.executeScript({ target: { tabId: t.id }, files: ["content.js"] }); } catch (e) {}
+          }
+        }
+        await report();
       } else if (c.type === "reload_ext") {
         chrome.runtime.reload();
       } else if (c.type === "reload_hark") {

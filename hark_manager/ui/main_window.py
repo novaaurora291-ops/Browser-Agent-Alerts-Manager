@@ -1,16 +1,13 @@
-import time
-
 from PySide6.QtCore import Qt, QTimer, QSize
-from PySide6.QtGui import QIcon, QAction
 from PySide6.QtWidgets import (QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel, QStackedWidget,
-                               QScrollArea, QFrame, QSystemTrayIcon, QMenu, QApplication, QMessageBox)
+                               QScrollArea, QSystemTrayIcon, QMenu, QApplication, QMessageBox)
 
 from . import icons
 from .pages import ProfilesPage, AlertsPage, SettingsPage
 from .widgets import card, label, button, IconLabel, Dot
 from .style import build_qss, ORANGE, GREEN, GRAY
 from .. import config
-from ..config import APP_TITLE, log
+from ..config import APP_TITLE
 
 
 class NavButton(QPushButton):
@@ -149,6 +146,11 @@ class MainWindow(QMainWindow):
         h.addWidget(self.right)
 
         self.mv = None
+        from .dock import Dock
+        self.dock = Dock(ctl, self)
+        self.dock.mv_open = lambda: self.mv is not None and self.mv.isVisible()
+        self.view.dock = self.dock
+        QApplication.instance().aboutToQuit.connect(self.dock.release_all)
         self.profiles.open_multiview.connect(self.open_multiview)
         self.profiles.install_bridge.connect(self.install_bridge)
         self.profiles.open_view.connect(lambda d: ctl.view_profile(ctl.profile(d)) if ctl.profile(d) else None)
@@ -181,7 +183,7 @@ class MainWindow(QMainWindow):
 
     def go(self, i):
         if self.stack.currentIndex() == 3 and i != 3:
-            # leaving the live view (Back or a nav click): hand the browser window back to the desktop
+            # leaving the live view (Back or a nav click): the window stays docked and running, out of sight
             if self.view.expanded:
                 self.view.toggle_expand()
             self.view.release()
@@ -196,7 +198,7 @@ class MainWindow(QMainWindow):
     def open_multiview(self):
         if self.mv is None:
             from .multiview import MultiView
-            self.mv = MultiView(self.ctl, self._release_main)
+            self.mv = MultiView(self.ctl, self._release_main, self.dock)
             QApplication.instance().aboutToQuit.connect(self.mv.release_all)
         self.mv.open()
 
@@ -282,7 +284,8 @@ class MainWindow(QMainWindow):
             return
         self.quitting = True
         if self.mv is not None and self.mv.isVisible():
-            self.mv.close()      # every hosted browser window back to the desktop first
+            self.mv.close()
+        self.dock.release_all()  # every docked Cent window back to the desktop: Windows would close it with us
         self.tray.hide()
         self.ctl.bridge.stop()
         e.accept()

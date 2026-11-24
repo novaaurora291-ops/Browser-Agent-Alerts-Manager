@@ -139,6 +139,7 @@
     try { if (window.__hbmLoaded !== HBM_VER) return; chrome.runtime.sendMessage({ type: "hark_state", state: st }); } catch (e) {}
   }
   chrome.runtime.onMessage.addListener((msg, _s, send) => {
+    if (msg && msg.type === "rescan") { last = ""; tick(true); send({ ok: true }); return; }
     if (msg && msg.type === "send_text") {
       const ed = document.querySelector("textarea, [contenteditable=true], [role=textbox]");
       if (!ed) { send({ ok: false, err: "no composer" }); return; }

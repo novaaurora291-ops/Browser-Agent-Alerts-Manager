@@ -4,7 +4,7 @@ import re
 
 from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QFrame, QWidget,
-                               QButtonGroup, QMessageBox, QComboBox, QPlainTextEdit, QScrollArea, QSizePolicy)
+                               QButtonGroup, QComboBox, QPlainTextEdit, QScrollArea, QSizePolicy)
 
 from . import icons
 from .widgets import label, button
@@ -157,7 +157,7 @@ class AddProfileDialog(QDialog):
         self.jobs = []
         exe = self.ctl.browser_exe()
         self.managed = bool(exe)
-        self.bname = chrome_mod.browser_name(exe) if exe else "Google Chrome"
+        self.bname = "Cent Browser"
         self.cent = "cent" in self.bname.lower()
 
         root = QVBoxLayout(self)
@@ -212,7 +212,7 @@ class AddProfileDialog(QDialog):
         self.browser.addItem(self.bname)     # the browser saved in Settings
         self.browser.setEnabled(False)
         self.browser.setMinimumHeight(32)
-        self.browser.setToolTip(exe or "Settings mein Browser EXE Path set nahi; Google Chrome ka apna profile banega")
+        self.browser.setToolTip(exe or "Settings mein Cent Browser Path set nahi")
         bcol.addWidget(self.browser)
         bc.addLayout(bcol, 3)
         self.cnt_box = QWidget()
@@ -541,16 +541,8 @@ class AddProfileDialog(QDialog):
             self.msg.setText("Auto sign-in ke liye email aur password dono chahiye.")
             return
         if not self.managed:
-            # plain Google Chrome profile: Chrome makes it, the user signs in there
-            try:
-                r = self.ctl.add_profile(name, launch=True)
-            except Exception as e:
-                self.msg.setText(f"Profile nahi ban saka: {e}")
-                return
-            self.page.rebuild()
-            self.pw.clear()
-            QMessageBox.information(self, "Add profile", f"Chrome mein naya profile ({r['dir']}) khul raha hai. Wahan Hark mein sign in kar lein; ye list mein khud aa jayega.")
-            return self.accept()
+            self.msg.setText("Cent Browser nahi mila. Settings mein Cent Browser Path set karein (sirf Cent supported hai).")
+            return
         email = self.email.text().strip() if auto else ""
         if auto:
             self._pws = {email.lower(): self.pw.text()}

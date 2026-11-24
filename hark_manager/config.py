@@ -39,8 +39,9 @@ def browser_profiles_dir():
     return os.path.join(LOCALDATA, "BrowserProfiles")
 
 DEFAULTS = {
-    "default_browser": "Google Chrome",
-    "browser_exe": "",            # browser used by Add profile (e.g. Cent Browser's chrome.exe); empty = Google Chrome
+    "default_browser": "Cent Browser",
+    "browser_exe": "",            # Cent Browser's chrome.exe (the only supported browser); empty = found automatically
+    "keep_docked": True,          # Cent windows stay docked inside the Manager (no desktop window / taskbar icon)
     "managed_profiles": [],       # [{id, name, exe, data_dir, created}] profiles with their own user-data-dir
     "preview_refresh": 5,
     "show_previews": True,

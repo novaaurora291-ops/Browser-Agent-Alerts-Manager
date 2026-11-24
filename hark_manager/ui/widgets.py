@@ -1,6 +1,8 @@
-from PySide6.QtCore import Qt, Signal, QSize, QPropertyAnimation, QEasingCurve, Property, QRectF
-from PySide6.QtGui import QPainter, QColor, QPixmap, QPainterPath
-from PySide6.QtWidgets import (QFrame, QLabel, QHBoxLayout, QVBoxLayout, QPushButton, QWidget, QLineEdit,
+import math
+
+from PySide6.QtCore import Qt, QSize, QPropertyAnimation, QEasingCurve, Property, QRectF, QVariantAnimation
+from PySide6.QtGui import QPainter, QColor, QPixmap, QPainterPath, QPen, QMovie
+from PySide6.QtWidgets import (QFrame, QLabel, QHBoxLayout, QPushButton, QWidget, QLineEdit,
                                QAbstractButton, QSizePolicy)
 
 from . import icons
@@ -59,7 +61,73 @@ class Dot(QWidget):
         p.drawEllipse(1, 1, self.d, self.d)
 
 
-STATUS_COLORS = {"Working": GREEN, "Needs reply": ORANGE, "Idle": GRAY, "Closed": GRAY}
+STATUS_COLORS = {"Running": GREEN, "Needs reply": ORANGE, "Idle": GRAY, "Closed": GRAY}
+
+_ROBOT = None
+
+
+def robot_movie():
+    """One shared 24x24 looping working-robot GIF (transparent) for every Running status."""
+    global _ROBOT
+    if _ROBOT is None:
+        from ..config import resource_path
+        _ROBOT = QMovie(resource_path("hark_manager", "ui", "assets", "working-robot.gif"))
+        _ROBOT.setScaledSize(QSize(24, 24))
+        _ROBOT.setCacheMode(QMovie.CacheAll)
+        _ROBOT.start()
+    return _ROBOT
+
+
+class AlertPulse:
+    """Soft pulsing orange border for a card/row whose profile Needs reply. Call _pulse_init() once,
+    set_pulse(on) on every refresh, and _paint_pulse() at the end of paintEvent."""
+    PULSE_MS = 1600
+
+    def _pulse_init(self, radius=14):
+        self._pulse = None
+        self._pulse_v = 0.0
+        self._pulse_r = radius
+
+    def set_pulse(self, on):
+        if on and self._pulse is None:
+            a = QVariantAnimation(self)
+            a.setStartValue(0.0)
+            a.setEndValue(1.0)
+            a.setDuration(self.PULSE_MS)
+            a.setLoopCount(-1)
+            a.valueChanged.connect(self._pulse_tick)
+            self._pulse = a
+            a.start()
+        elif not on and self._pulse is not None:
+            self._pulse.stop()
+            self._pulse.deleteLater()
+            self._pulse = None
+            self._pulse_v = 0.0
+            self.update()
+
+    def _pulse_tick(self, v):
+        self._pulse_v = float(v)
+        self.update()
+
+    def _paint_pulse(self):
+        if self._pulse is None:
+            return
+        t = (1 - math.cos(2 * math.pi * self._pulse_v)) / 2      # 0 -> 1 -> 0, smooth
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(Qt.NoBrush)
+        r = self._pulse_r
+        # faint glow inside the border, strongest at the peak of the pulse
+        glow = QColor(ORANGE)
+        glow.setAlpha(int(70 * t))
+        p.setPen(QPen(glow, 6))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(4, 4, -4, -4), r - 3, r - 3)
+        # the border itself breathes between soft and full orange
+        c = QColor(ORANGE)
+        c.setAlpha(int(110 + 145 * t))
+        p.setPen(QPen(c, 2.5))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(1.25, 1.25, -1.25, -1.25), r, r)
+        p.end()
 
 
 class StatusLabel(QWidget):
@@ -69,13 +137,34 @@ class StatusLabel(QWidget):
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(8)
         self.dot = Dot(STATUS_COLORS.get(status, GRAY), 13)
+        self.robot = QLabel()                  # Running: animated robot in place of the green dot
+        self.robot.setFixedSize(24, 24)
+        self.robot.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.robot.setStyleSheet("background:transparent;")
+        self.robot.setToolTip("Running")
+        self.robot.hide()
         self.text = QLabel(status)
         self.text.setStyleSheet("font-size:16px")
         h.addWidget(self.dot)
+        h.addWidget(self.robot)
         h.addWidget(self.text)
         h.addStretch()
+        self._s = None
+        self.set_status(status)
 
     def set_status(self, s):
+        if s == self._s:
+            return
+        self._s = s
+        running = s == "Running"
+        if running:
+            if self.robot.movie() is None:
+                self.robot.setMovie(robot_movie())
+            self.dot.hide()
+            self.robot.show()
+        else:
+            self.robot.hide()
+            self.dot.show()
         self.dot.set_color(STATUS_COLORS.get(s, GRAY))
         self.text.setText(s)
         self.text.setStyleSheet("font-size:16px;" + ("color:#7a4b00;" if s == "Needs reply" else ""))

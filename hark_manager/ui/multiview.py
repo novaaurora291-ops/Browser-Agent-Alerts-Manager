@@ -1,9 +1,11 @@
 """Live Multi-View: the open profiles' real browser windows side by side in a separate, maximised window.
 
-Same embedding as the single live view (browser_view): each profile's own Chrome / Cent window (its own
-process, data folder and signed-in session) is re-parented into a pane, so its Hark chat can be read, scrolled
-and answered right there. Close (or the window's X) hands every window back to the desktop at the position,
-size and maximised/minimised state it had before."""
+Every running Cent window (docked in the Manager or still on the desktop) is docked into a pane with Win32
+SetParent: its own process, data folder and signed-in session, so its Hark chat can be read, scrolled and
+answered right there. Docked windows have no taskbar button. A Cent profile launched while the grid is open is
+added to it automatically. Close (or the window's X): with "Keep Cent windows docked" on (default) every window
+stays docked and running inside the Manager; with it off each returns to its desktop position, size,
+maximised/minimised state and taskbar button. A window whose docking fails is put back on the desktop as it was."""
 import json
 import math
 import time
@@ -142,17 +144,19 @@ class Pane(QFrame):
             chrome.embed_resize(self.hwnd, w, h)
 
     def take(self, hwnd):
-        """Host this browser window (first time: embed and remember how it was; later: just move it here)."""
+        """Dock this Cent window into the pane (from the desktop, or moved over from where it is docked)."""
         self.host.show()
         self.msg.hide()
         hid = int(self.host.winId())
-        if hwnd in self.mv.states:
-            chrome.reparent(hwnd, hid)
-        else:
-            self.mv.states[hwnd] = chrome.embed(hwnd, hid)
-            log(f"multiview embedded {self.dir} hwnd={hwnd}")
+        dock = self.mv.dock
+        origin = "dock" if dock.has(hwnd) else "desktop"
+        if not dock.dock(self.dir, hwnd, hid, "grid", origin):
+            self.host.hide()
+            self.msg.setText("Docking fail hui: window apni jagah desktop par wapas hai.")
+            self.msg.show()
+            self.failed = hwnd
+            return
         self.hwnd = hwnd
-        self.mv.ctl.embedded[self.dir] = hwnd
         self.fit()
         self.hark_tries, self.hark_next = 0, 0
         self.ask_hark()
@@ -183,8 +187,7 @@ class Pane(QFrame):
     def poll(self):
         if self.hwnd:
             if not chrome.is_window(self.hwnd):
-                self.mv.states.pop(self.hwnd, None)
-                self.mv.ctl.embedded.pop(self.dir, None)
+                self.mv.dock.forget(self.hwnd)
                 self.hwnd = None
                 self.host.hide()
                 self.msg.setText("Browser window band ho gayi. Refresh dabayein.")
@@ -197,7 +200,12 @@ class Pane(QFrame):
         p = self.mv.ctl.profile(self.dir)
         if not p:
             return
-        wins = [w for w in chrome.windows_for(p) if chrome.is_window(w[0]) and w[0] not in self.mv.states]
+        dock = self.mv.dock
+        h = dock.window_of(self.dir, "park")
+        if h:
+            return self.take(h)
+        wins = [w for w in chrome.windows_for(p) if chrome.is_window(w[0]) and not dock.has(w[0])
+                and w[0] != getattr(self, "failed", None)]
         if wins:
             hark = [w for w in wins if "hark" in (w[1] or "").lower()]
             return self.take((hark or wins)[0][0])
@@ -223,12 +231,12 @@ class Pane(QFrame):
 
 
 class MultiView(QWidget):
-    def __init__(self, ctl, release_main=None):
+    def __init__(self, ctl, release_main=None, dock=None):
         super().__init__(None, Qt.Window)
         self.ctl = ctl
         self.release_main = release_main or (lambda d: None)
+        self.dock = dock
         self.panes = []
-        self.states = {}         # hwnd -> how it was before we hosted it (restored on Close)
         self.expanded = None
         self.rows = []
         self.qs = QSettings("Hark", "HarkBrowserManager")
@@ -314,12 +322,6 @@ class MultiView(QWidget):
         self.cv.setContentsMargins(0, 0, 0, 0)
         self.scroll.setWidget(self.canvas)
         v.addWidget(self.scroll, 1)
-        # a parking host keeps browser windows alive while the splitters are rebuilt
-        self.park = Host()
-        self.park.setParent(self)
-        self.park.setMinimumSize(1, 1)
-        self.park.setGeometry(0, 0, 1, 1)
-        self.park.hide()
         self.outer = None
 
         lay = self.qs.value("multiview/layout", DEFAULT_LAYOUT)
@@ -348,10 +350,10 @@ class MultiView(QWidget):
         self.t_status.start()
 
     def open_dirs(self):
-        """Open Hark profiles (a window on screen, or one we already host), in the saved pane order."""
+        """Running Cent profiles (a window on the desktop, or one docked in the Manager), in the saved pane order."""
         self.ctl.refresh_windows()
-        dirs = [p.directory for p in self.ctl.profiles
-                if self.ctl.windows.get(p.directory) or p.directory in self.ctl.embedded]
+        dirs = [p.directory for p in self.ctl.profiles if p.directory not in self.ctl.no_dock and
+                (self.ctl.windows.get(p.directory) or p.directory in self.ctl.embedded)]
         order = self.saved_order()
         return sorted(dirs, key=lambda d: (order.index(d) if d in order else 10 ** 4, dirs.index(d)))
 
@@ -377,11 +379,9 @@ class MultiView(QWidget):
         self.save_splits()
         for pane in self.panes:
             if pane.hwnd:
-                chrome.unembed(pane.hwnd, self.states.get(pane.hwnd) or {})
-                self.ctl.embedded.pop(pane.dir, None)
-                log(f"multiview released {pane.dir} hwnd={pane.hwnd}")
+                self.dock.give_back(pane.hwnd)
+                log(f"multiview released {pane.dir} hwnd={pane.hwnd} -> {'docked (hidden)' if self.dock.has(pane.hwnd) else 'desktop'}")
                 pane.hwnd = None
-        self.states.clear()
         self.expanded = None
         self._clear_layout()
         QTimer.singleShot(300, self.ctl.refresh_windows)
@@ -389,8 +389,8 @@ class MultiView(QWidget):
     # ---------- building ----------
     def _clear_layout(self):
         for pane in self.panes:
-            if pane.hwnd:
-                chrome.reparent(pane.hwnd, int(self.park.winId()))
+            if pane.hwnd and self.dock.has(pane.hwnd):
+                chrome.reparent(pane.hwnd, self.dock.park_id)    # kept alive while the splitters are rebuilt
             pane.setParent(None)
             pane.deleteLater()
         self.panes = []
@@ -406,11 +406,10 @@ class MultiView(QWidget):
         for p in self.panes:
             if p.hwnd:
                 keep[p.dir] = p.hwnd
-        # windows that drop out of the grid go back to the desktop
+        # windows that drop out of the grid go back to where they were before it
         for d, h in list(keep.items()):
             if d not in dirs:
-                chrome.unembed(h, self.states.pop(h, {}) or {})
-                self.ctl.embedded.pop(d, None)
+                self.dock.give_back(h)
                 keep.pop(d)
         self._clear_layout()
         self.expanded = None
@@ -587,9 +586,9 @@ class MultiView(QWidget):
         """Swap two panes: their browser windows trade hosts (no window is closed or re-created)."""
         ha, hb = a.hwnd, b.hwnd
         if ha:
-            chrome.reparent(ha, int(self.park.winId()))
+            chrome.reparent(ha, self.dock.park_id)
         if hb:
-            chrome.reparent(hb, int(self.park.winId()))
+            chrome.reparent(hb, self.dock.park_id)
         a.dir, b.dir = b.dir, a.dir
         a.hwnd = b.hwnd = None
         a.deadline = b.deadline = time.time() + 25
@@ -606,3 +605,16 @@ class MultiView(QWidget):
     def poll(self):
         for p in self.panes:
             p.poll()
+        if time.time() - getattr(self, "_auto_t", 0) > 2:
+            self._auto_t = time.time()
+            self.auto_add()
+
+    def auto_add(self):
+        """A Cent profile launched (or a docked one) while the grid is open gets its own pane automatically."""
+        cur = [p.dir for p in self.panes]
+        new = [p.directory for p in self.ctl.profiles if p.directory not in cur and p.directory not in self.ctl.no_dock
+               and (any(not self.dock.has(w[0]) and w[0] not in self.dock.released for w in self.ctl.windows.get(p.directory) or [])
+                    or self.dock.window_of(p.directory, "park"))]
+        if new:
+            log(f"multiview auto-add: {new}")
+            self.build(cur + new)

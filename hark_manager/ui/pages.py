@@ -6,11 +6,11 @@ import threading
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QRect, QObject
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox, QPushButton,
                                QScrollArea, QFrame, QMenu, QInputDialog, QButtonGroup, QLineEdit, QMessageBox,
-                               QSizePolicy, QApplication, QFileDialog, QRubberBand)
+                               QSizePolicy, QFileDialog, QRubberBand)
 
 from . import icons
-from .widgets import card, label, button, StatusLabel, Toggle, SearchBox, Preview, IconLabel, Dot, VpnBadge
-from .style import ORANGE, GREEN, GRAY, LIME
+from .widgets import card, label, button, StatusLabel, Toggle, SearchBox, Preview, IconLabel, Dot, VpnBadge, AlertPulse
+from .style import ORANGE, GREEN, GRAY
 from .. import config, notify
 from ..core import EXT_VERSION as EXT_VER
 from .. import chrome as chrome_mod
@@ -106,10 +106,11 @@ class Selectable:
         self.page.selection_menu(e.globalPos())
 
 
-class ProfileCard(Selectable, QFrame):
+class ProfileCard(Selectable, AlertPulse, QFrame):
     def __init__(self, page, p):
         super().__init__()
         self.page, self.p = page, p
+        self._pulse_init(14)
         self.setObjectName("card")
         self.setMinimumSize(260, 345)
         v = QVBoxLayout(self)
@@ -144,6 +145,7 @@ class ProfileCard(Selectable, QFrame):
         self.status.set_status(s)
         self.vpn.set_state(*c.vpn(self.p), who=self.p.name)
         self.setObjectName("cardSel" if self.selected() else ("cardAlert" if s == "Needs reply" else "card"))
+        self.set_pulse(s == "Needs reply" and not self.selected())
         self.show_result()
         self._a11y()
         self.style().unpolish(self)
@@ -159,6 +161,10 @@ class ProfileCard(Selectable, QFrame):
         mini = open_ and all(w[3] for w in c.windows.get(self.p.directory, []))
         ph = "Closed" if not open_ else ("Minimized" if mini else ("Previews off" if not show else "Loading preview…"))
         self.preview.set_png(c.previews.get(self.p.directory) if (open_ and show) else None, ph)
+
+    def paintEvent(self, e):
+        QFrame.paintEvent(self, e)
+        self._paint_pulse()
 
     def mouseDoubleClickEvent(self, e):
         # double-click: the profile's live Hark chat inside the Manager
@@ -202,10 +208,11 @@ class ProfileCard(Selectable, QFrame):
         self.page.rebuild()
 
 
-class ProfileRow(Selectable, QFrame):
+class ProfileRow(Selectable, AlertPulse, QFrame):
     def __init__(self, page, p):
         super().__init__()
         self.page, self.p = page, p
+        self._pulse_init(14)
         self.setObjectName("card")
         h = QHBoxLayout(self)
         h.setContentsMargins(16, 10, 16, 10)
@@ -216,7 +223,13 @@ class ProfileRow(Selectable, QFrame):
         h.addWidget(self.prev)
         col = QVBoxLayout()
         self.name = label(p.name, size=18, bold=True)
-        col.addWidget(self.name)
+        nh = QHBoxLayout()
+        nh.setSpacing(8)
+        nh.addWidget(self.name)
+        self.vpn = VpnBadge(13)
+        nh.addWidget(self.vpn)
+        nh.addStretch(1)
+        col.addLayout(nh)
         col.addWidget(label(p.email or "Not signed in", obj="muted"))
         col.addWidget(self._make_result_row())
         h.addLayout(col, 2)
@@ -228,6 +241,7 @@ class ProfileRow(Selectable, QFrame):
         h.addWidget(self.action)
 
     mouseDoubleClickEvent = ProfileCard.mouseDoubleClickEvent
+    paintEvent = ProfileCard.paintEvent
 
     def refresh(self):
         c = self.page.ctl
@@ -235,7 +249,8 @@ class ProfileRow(Selectable, QFrame):
         self.name.setText(self.p.name)
         self.status.set_status(s)
         self.vpn.set_state(*c.vpn(self.p), who=self.p.name)
-        self.setObjectName("cardSel" if self.selected() else "card")
+        self.setObjectName("cardSel" if self.selected() else ("cardAlert" if s == "Needs reply" else "card"))
+        self.set_pulse(s == "Needs reply" and not self.selected())
         self.show_result()
         self._a11y()
         self.style().unpolish(self)
@@ -247,7 +262,7 @@ class ProfileRow(Selectable, QFrame):
 
 
 def short_browser(name):
-    return "Chrome" if name == "Google Chrome" else name
+    return name
 
 
 class ClosedRow(QFrame):
@@ -312,7 +327,18 @@ class ProfilesPage(QWidget):
         v = QVBoxLayout(self)
         v.setContentsMargins(24, 22, 24, 10)
         v.setSpacing(18)
-        v.addWidget(label("Browser profiles", obj="h1"))
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        head.addWidget(label("Browser profiles", obj="h1"))
+        head.addStretch(1)
+        self.refresh_btn = button("  Refresh", "outline", "refresh", 18)
+        self.refresh_btn.setMinimumHeight(40)
+        self.refresh_btn.setStyleSheet("font-size:15px; padding: 6px 16px;")
+        self.refresh_btn.setToolTip("Sab Cent profiles ka live Hark status dobara check karo")
+        self.refresh_btn.setAccessibleName("Refresh profile statuses")
+        self.refresh_btn.clicked.connect(self.recheck_status)
+        head.addWidget(self.refresh_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
+        v.addLayout(head)
         tabs = QHBoxLayout()
         tabs.setSpacing(0)
         self.t_open = QPushButton("Open")
@@ -344,8 +370,9 @@ class ProfilesPage(QWidget):
         self.bfilter.setMinimumHeight(42)
         self.bfilter.setMinimumWidth(170)
         self.bfilter.currentIndexChanged.connect(self.rebuild)
+        self.bfilter.hide()        # Cent Browser only: no browser picker
         self.filter = QComboBox()
-        self.filter.addItems(["All statuses", "Working", "Needs reply", "Idle", "Closed"])
+        self.filter.addItems(["All statuses", "Running", "Needs reply", "Idle", "Closed"])
         self.filter.setMinimumHeight(42)
         self.filter.setMinimumWidth(150)
         self.filter.currentIndexChanged.connect(self.rebuild)
@@ -406,6 +433,21 @@ class ProfilesPage(QWidget):
         ctl.previews_changed.connect(self.refresh)
         self.rebuild()
 
+    def recheck_status(self):
+        """Refresh button: ask every Cent profile's bridge for its live Hark state now, then sync cards + Needs reply."""
+        b = self.refresh_btn
+        if not b.isEnabled():
+            return
+        b.setEnabled(False)
+        b.setText("  Checking…")
+
+        def done(summary):
+            b.setText("  Refresh")
+            b.setEnabled(True)
+            b.setToolTip(f"Last check: {summary}")
+            self.rebuild()
+        self.ctl.recheck_all(done)
+
     def set_tab(self, t):
         self.tab = t
         (self.t_open if t == "open" else self.t_closed).setChecked(True)
@@ -424,37 +466,16 @@ class ProfilesPage(QWidget):
         self.cols = self._calc_cols()
         self.rebuild()
 
-    def browser_options(self):
-        """Browsers that are saved: the one in Settings plus every browser a profile was made with."""
-        names = {"Chrome"}
-        exe = self.ctl.browser_exe()
-        if exe:
-            names.add(short_browser(chrome_mod.browser_name(exe)))
-        for p in self.ctl.profiles:
-            names.add(short_browser(p.browser_name))
-        return ["Chrome"] + sorted(n for n in names if n != "Chrome")
-
     def update_browser_filter(self):
-        opts = ["All browsers"] + self.browser_options()
-        if [self.bfilter.itemText(i) for i in range(self.bfilter.count())] == opts:
-            return
-        cur = self.bfilter.currentText()
-        self.bfilter.blockSignals(True)
-        self.bfilter.clear()
-        self.bfilter.addItems(opts)
-        self.bfilter.setCurrentIndex(max(0, opts.index(cur) if cur in opts else 0))
-        self.bfilter.blockSignals(False)
+        pass                       # Cent Browser only
 
     def visible_profiles(self):
         q = self.search.text().strip().lower()
         f = self.filter.currentText()
-        bf = self.bfilter.currentText()
         hid = set(self.ctl.settings["hidden_profiles"] or [])
         out = []
         for p in self.ctl.profiles:
             if p.directory in hid:
-                continue
-            if bf != "All browsers" and short_browser(p.browser_name) != bf:
                 continue
             if q and q not in (p.name + " " + p.email + " " + p.chrome_name + " " + p.gaia).lower():
                 continue
@@ -466,13 +487,12 @@ class ProfilesPage(QWidget):
         # profiles needing a reply / open first, like the mock-up
         if self.tab == "closed":
             return sorted(out, key=lambda p: (p.managed, p.name.lower()))
-        rank = {"Needs reply": 0, "Working": 1, "Idle": 2, "Closed": 3}
+        rank = {"Needs reply": 0, "Running": 1, "Idle": 2, "Closed": 3}
         return sorted(out, key=lambda p: rank.get(self.ctl.status(p), 9))
 
     def update_counts(self):
         hid = set(self.ctl.settings["hidden_profiles"] or [])
-        bf = self.bfilter.currentText()
-        ps = [p for p in self.ctl.profiles if p.directory not in hid and (bf == "All browsers" or short_browser(p.browser_name) == bf)]
+        ps = [p for p in self.ctl.profiles if p.directory not in hid]
         n = sum(1 for p in ps if self.is_open(p))
         self.t_open.setText(f"Open ({n})")
         self.t_closed.setText(f"Closed ({len(ps) - n})")
@@ -565,9 +585,8 @@ class ProfilesPage(QWidget):
             self.bar.removeWidget(w)
         for c in range(7):
             self.bar.setColumnStretch(c, 0)
-        if narrow:  # two rows: search + browsers, then status + view + add
-            self.bar.addWidget(self.search, 0, 0, 1, 3)
-            self.bar.addWidget(self.bfilter, 0, 3, 1, 2)
+        if narrow:  # two rows: search, then status + view + add
+            self.bar.addWidget(self.search, 0, 0, 1, 5)
             self.bar.addWidget(self.filter, 1, 0)
             self.bar.addWidget(self.seg, 1, 1)
             self.bar.addWidget(self.sel_label, 1, 2)
@@ -576,8 +595,7 @@ class ProfilesPage(QWidget):
             self.bar.setColumnStretch(0, 1)
             self.bar.setColumnStretch(2, 1)
         else:
-            self.bar.addWidget(self.search, 0, 0)
-            self.bar.addWidget(self.bfilter, 0, 1)
+            self.bar.addWidget(self.search, 0, 0, 1, 2)
             self.bar.addWidget(self.filter, 0, 2)
             self.bar.addWidget(self.seg, 0, 3)
             self.bar.addWidget(self.sel_label, 0, 4)
@@ -807,6 +825,7 @@ class ProfilesPage(QWidget):
         emit = self.relay.result.emit
         for p in ps:
             k = p.directory
+            self.ctl.no_dock.add(k)      # the Extensions window is driven on the desktop, docked again afterwards
             try:
                 running = bool(self.ctl.windows.get(k))
                 emit(k, "run", "Checking…", "Bridge dhoond raha hoon")
@@ -817,7 +836,7 @@ class ProfilesPage(QWidget):
                 ext = config.ensure_profile_extension(p.data_dir, p.tag) if p.managed else config.ensure_extension()
                 t0 = time.time()
                 emit(k, "run", "Installing…", "Extensions · Load unpacked")
-                ok, msg = installer.install_bridge(p, ext, self.ctl.exe_for(p) if p.managed else None)
+                ok, msg = installer.install_bridge(p, ext, self.ctl.exe_for(p))
                 if not ok:
                     emit(k, "fail", "Install failed", msg)
                     continue
@@ -842,6 +861,8 @@ class ProfilesPage(QWidget):
             except Exception as e:
                 config.log(f"bridge install {k}: {e}")
                 emit(k, "fail", "Install failed", str(e)[:60])
+            finally:
+                self.ctl.no_dock.discard(k)
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -1098,7 +1119,7 @@ class SettingsPage(QWidget):
         # Browser & previews
         c1, v1 = section("Browser & previews")
         self.exe = QLineEdit()
-        self.exe.setPlaceholderText("Khali = Google Chrome")
+        self.exe.setPlaceholderText("Cent Browser ki chrome.exe (khali = khud dhoondo)")
         self.exe.setMinimumHeight(38)
         self.exe.textChanged.connect(self._exe_hint)
         self.browse = button("Browse…", "outline")
@@ -1119,7 +1140,7 @@ class SettingsPage(QWidget):
         self.t_prev = Toggle()
         v1.addSpacing(8)
         exe_w.setProperty("expand", True)
-        v1.addWidget(row("Browser EXE Path", exe_w))
+        v1.addWidget(row("Cent Browser Path", exe_w))
         v1.addWidget(self.exe_hint); v1.addWidget(hline())
         v1.addWidget(row("Preview refresh", self.refresh_cb)); v1.addWidget(hline())
         v1.addWidget(row("Show browser previews", self.t_prev))
@@ -1176,10 +1197,13 @@ class SettingsPage(QWidget):
         # Startup & taskbar
         c3, v3 = section("Startup & taskbar")
         self.t_start, self.t_tray, self.t_restore = Toggle(), Toggle(), Toggle()
+        self.t_dock = Toggle()
+        self.t_dock.setAccessibleName("Keep Cent windows docked")
         v3.addSpacing(8)
         v3.addWidget(row("Start with Windows", self.t_start)); v3.addWidget(hline())
         v3.addWidget(row("Minimize to tray", self.t_tray)); v3.addWidget(hline())
-        v3.addWidget(row("Restore last view", self.t_restore))
+        v3.addWidget(row("Restore last view", self.t_restore)); v3.addWidget(hline())
+        v3.addWidget(row("Keep Cent windows docked", self.t_dock))
         g.addWidget(c3, 1, 0)
 
         # Desktop notifications
@@ -1238,6 +1262,7 @@ class SettingsPage(QWidget):
             self.t_start.setChecked(bool(s["start_with_windows"]))
         self.t_tray.setChecked(bool(s["minimize_to_tray"]))
         self.t_restore.setChecked(bool(s["restore_last_view"]))
+        self.t_dock.setChecked(bool(s["keep_docked"]))
         self.t_desk.setChecked(bool(s["desktop_alerts"]))
         self.t_click.setChecked(bool(s["open_task_on_click"]))
         self.t_sound.setChecked(bool(s["play_sound"]))
@@ -1246,18 +1271,21 @@ class SettingsPage(QWidget):
 
     def pick_exe(self):
         start = os.path.dirname(self.exe.text().strip()) or chrome_mod.detect_cent() or os.environ.get("LOCALAPPDATA", "C:\\")
-        f, _ = QFileDialog.getOpenFileName(self, "Browser EXE chunein", start, "Browser (*.exe)")
+        f, _ = QFileDialog.getOpenFileName(self, "Cent Browser chrome.exe chunein", start, "Cent Browser (chrome.exe)")
         if f:
             self.exe.setText(os.path.normpath(f))
 
     def _exe_hint(self):
         exe = self.exe.text().strip().strip('"')
         if not exe:
-            self.exe_hint.setText("Add profile: Google Chrome ke andar naya profile (purana tareeqa).")
-        elif os.path.isfile(exe):
-            self.exe_hint.setText(f"Add profile: {chrome_mod.browser_name(exe)}, har profile ka alag folder: {config.browser_profiles_dir()}")
-        else:
+            found = chrome_mod.detect_cent()
+            self.exe_hint.setText(f"Khud mila: {found}" if found else "Cent Browser nahi mila. Browse karke Cent ki chrome.exe chunein.")
+        elif not os.path.isfile(exe):
             self.exe_hint.setText("Yeh file nahi mili.")
+        elif not chrome_mod.is_cent_exe(exe):
+            self.exe_hint.setText("Yeh Cent Browser nahi hai. Sirf Cent Browser supported hai (Chrome, Edge, Brave nahi).")
+        else:
+            self.exe_hint.setText(f"Cent Browser. Har profile ka alag folder: {config.browser_profiles_dir()}")
 
     def current_token(self):
         return self.token.text().strip() or config.get_bot_token()
@@ -1265,11 +1293,11 @@ class SettingsPage(QWidget):
     def save(self):
         s = self.ctl.settings
         exe = self.exe.text().strip().strip('"')
-        if exe and not (os.path.isfile(exe) and exe.lower().endswith(".exe")):
-            QMessageBox.warning(self, "Browser EXE Path", "Yeh .exe file nahi mili. Browse karke browser ki exe chunein.")
+        if exe and not chrome_mod.is_cent_exe(exe):
+            QMessageBox.warning(self, "Cent Browser Path", "Yeh Cent Browser ki chrome.exe nahi hai. Sirf Cent Browser supported hai.")
             return
         s["browser_exe"] = exe
-        s["default_browser"] = chrome_mod.browser_name(exe) if exe else "Google Chrome"
+        s["default_browser"] = "Cent Browser"
         s["preview_refresh"] = int(self.refresh_cb.currentText().split()[0])
         s["show_previews"] = self.t_prev.isChecked()
         s["telegram_enabled"] = self.t_tg.isChecked()
@@ -1285,10 +1313,12 @@ class SettingsPage(QWidget):
             QMessageBox.warning(self, "Startup", f"Windows startup set nahi ho saka: {e}")
         s["minimize_to_tray"] = self.t_tray.isChecked()
         s["restore_last_view"] = self.t_restore.isChecked()
+        s["keep_docked"] = self.t_dock.isChecked()
         s["desktop_alerts"] = self.t_desk.isChecked()
         s["open_task_on_click"] = self.t_click.isChecked()
         s["play_sound"] = self.t_sound.isChecked()
         s.save()
+        self.ctl.reload_profiles()        # Cent path may have changed: only profiles of that Cent are listed
         self.ctl.apply_preview_interval()
         self.banner.hide()
         self.load()
