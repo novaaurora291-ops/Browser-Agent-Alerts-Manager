@@ -52,6 +52,12 @@ async function post(path, body) {
   return j;
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+// every report may hand back queued commands for this profile: run them, never drop them
+async function postReport(body) {
+  const res = await post("/report", body);
+  if (res && res.commands && res.commands.length) runCommands(res.commands).catch(() => {});
+  return res;
+}
 // READ-ONLY look at a Hark tab: limit popup, reset time, chat loaded, message box active. Clicks/typing nothing.
 function hbmLimitProbe() {
   const shown = el => { for (let a = el, i = 0; a && i < 8; a = a.parentElement, i++) { const cs = getComputedStyle(a); if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0) return false; } const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
@@ -88,7 +94,7 @@ async function checkLimit(c) {
   if (opened) { try { await chrome.tabs.remove(opened.id); } catch (e) {} }
   const body = { email: await getEmail(), tag: await getTag(), ext_id: chrome.runtime.id, ver: chrome.runtime.getManifest().version,
                  tabs: [], windows: [], hark: null, limit_result: { id: c.id, tabs: out, opened: !!opened } };
-  await post("/report", body);
+  await postReport(body);
 }
 // ---- Safe Dispatch ----
 // READ-ONLY look at one Hark tab's composer and run state (in the page). Types/clicks nothing.
@@ -121,7 +127,7 @@ async function verifyTab(c) {
     try { wfocused = (await chrome.windows.get(t.windowId)).focused; } catch (e) {}
     out.push({ id: t.id, windowId: t.windowId, active: t.active, url: u, status: t.status, discarded: !!t.discarded, wfocused, probe });
   }
-  await post("/report", Object.assign(await baseBody(), { verify_result: { vid: c.vid, url: c.url, tabs: out, at: Date.now() } }));
+  await postReport(Object.assign(await baseBody(), { verify_result: { vid: c.vid, url: c.url, tabs: out, at: Date.now() } }));
 }
 const doneIds = new Set();
 async function seenDispatch(id) {
@@ -137,7 +143,7 @@ async function sendText(c) {
   const res = { dispatch_id: c.dispatch_id || "", tab_id: c.tab_id, url: c.url };
   const finish = async (status, reason, extra) => {
     Object.assign(res, { status, reason: reason || "" }, extra || {});
-    await post("/report", Object.assign(await baseBody(), { dispatch_result: res }));
+    await postReport(Object.assign(await baseBody(), { dispatch_result: res }));
   };
   if (!c.dispatch_id) return;                       // never send without a dispatch ID
   if (await seenDispatch(c.dispatch_id)) return finish("duplicate", "dispatch ID already used");
@@ -193,8 +199,8 @@ async function runCommands(cmds) {
         }
       } else if (c.type === "vpn_check") {
         vpnCache.at = 0;
-        await post("/report", { email: await getEmail(), tag: await getTag(), ext_id: chrome.runtime.id, ver: chrome.runtime.getManifest().version,
-                                tabs: [], windows: [], hark: null, vpn_only: true, vpn: await vpnState(true) });
+        await postReport({ email: await getEmail(), tag: await getTag(), ext_id: chrome.runtime.id, ver: chrome.runtime.getManifest().version,
+                           tabs: [], windows: [], hark: null, vpn_only: true, vpn: await vpnState(true) });
       } else if (c.type === "rescan") {
         // Manager Refresh: every Hark tab re-sends its live state now, then a fresh tab/window report
         const tabs = await chrome.tabs.query({ url: "https://hark.com/*" });

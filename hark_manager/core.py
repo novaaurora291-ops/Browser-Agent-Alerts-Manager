@@ -787,7 +787,7 @@ class Controller(QObject):
         return bool(ws) and all((self.worktrees_ok.get(w.get("alias")) or (False,))[0] for w in ws)
 
     # ---------- Safe Dispatch (bridge side) ----------
-    VERIFY_TIMEOUT = 15     # s for a profile's bridge to answer a fresh tab check
+    VERIFY_TIMEOUT = 35     # s for a profile's bridge to answer a fresh tab check (it reports every <= 30 s)
     PICKUP_TTL = 45         # s a send command may wait for its bridge; after that its dispatch ID is dead
     ACK_TIMEOUT = 60        # s after pickup without a result -> Unconfirmed (never re-sent)
 
@@ -855,7 +855,7 @@ class Controller(QObject):
     @staticmethod
     def prompt_key(tag, url, text):
         import hashlib
-        return (tag, url, hashlib.sha256((text or "").encode("utf-8")).hexdigest())
+        return f"{tag}|{url}|" + hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
     def already_sent(self, tag, url, text):
         did = self.sent_keys.get(self.prompt_key(tag, url, text))
