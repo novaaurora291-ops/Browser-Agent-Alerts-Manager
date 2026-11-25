@@ -11,7 +11,13 @@ async function getEmail() {
 }
 // a profile the Manager made with its own user-data-dir is identified by a tag (its managed profile ID) and
 // authenticated by its own secret token; both come from tag.json in this profile's copy of the extension
-let tag = null, token = null, build = "";
+let tag = null, token = null;
+// THIS script's own build. The Manager stamps it into the profile's copy of sw.js (config.ensure_profile_extension).
+// It is never read from tag.json: Chrome can keep running an older cached service worker under the same version,
+// and such a script used to report the build from the current tag.json, so it looked current while its VPN check
+// was the old one (VPN off shown although Browsec was on). Now a stale script reports its own old build and is
+// told to reload.
+const CODE_BUILD = "";
 async function readTagFile() {
   try { const r = await fetch(chrome.runtime.getURL("tag.json"), { cache: "no-store" }); if (r.ok) return await r.json(); } catch (e) {}
   return null;
@@ -19,7 +25,7 @@ async function readTagFile() {
 async function getTag() {
   if (tag !== null) return tag;
   const j = await readTagFile();
-  if (j && j.tag) { tag = j.tag + ""; token = (j.token || "") + ""; if (!build) build = (j.build || "") + ""; return tag; }
+  if (j && j.tag) { tag = j.tag + ""; token = (j.token || "") + ""; return tag; }
   try { const r = await chrome.storage.local.get("hbm_tag"); tag = r.hbm_tag || ""; } catch (e) { tag = ""; }
   token = "";
   return tag;
@@ -199,7 +205,7 @@ async function runCommands(cmds) {
         }
       } else if (c.type === "vpn_check") {
         vpnCache.at = 0;
-        await postReport({ email: await getEmail(), tag: await getTag(), ext_id: chrome.runtime.id, ver: chrome.runtime.getManifest().version,
+        await postReport({ email: await getEmail(), tag: await getTag(), ext_id: chrome.runtime.id, ver: chrome.runtime.getManifest().version, build: CODE_BUILD,
                            tabs: [], windows: [], hark: null, vpn_only: true, vpn: await vpnState(true) });
       } else if (c.type === "rescan") {
         // Manager Refresh: every Hark tab re-sends its live state now, then a fresh tab/window report
@@ -265,7 +271,7 @@ async function report(extra) {
     tag: await getTag(),
     ext_id: chrome.runtime.id,
     ver: chrome.runtime.getManifest().version,
-    build,
+    build: CODE_BUILD,
     windows: wins.map(w => ({ id: w.id, focused: w.focused, state: w.state })),
     tabs: tabs.map(t => ({ id: t.id, windowId: t.windowId, active: t.active, url: t.url || "", title: t.title || "" })),
     hark: extra || null,

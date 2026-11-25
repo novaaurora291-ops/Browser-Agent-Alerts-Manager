@@ -2,7 +2,7 @@
 import threading
 import os
 import time
-EXT_VERSION = "1.0.16"   # must equal extension/manifest.json "version"
+EXT_VERSION = "1.0.17"   # must equal extension/manifest.json "version"
 ALERT_GRACE = 15  # an alert Hark no longer shows as waiting (live DOM) is cleared after this many seconds
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -454,16 +454,24 @@ class Controller(QObject):
         st = self.state.setdefault(p.directory, {"t": 0, "tabs": [], "hark": {}, "email": email})
         st["tag"] = st.get("tag", "")
         st["ver"] = rep.get("ver") or ""
+        # the script this profile is really running (its own stamped build): an older one is reloaded below
+        old_script = rep.get("ver") != EXT_VERSION or (rep.get("build") or "") != config.extension_build()
         if "vpn" in rep:
             old = (st.get("vpn") or {}).get("state"), (st.get("vpn") or {}).get("country")
             st["vpn"] = rep["vpn"] or {}
+            if old_script:
+                # an older bridge script's VPN look is not trusted (it showed VPN off while Browsec was on):
+                # Unknown until the reloaded current script answers
+                st["vpn"] = {"state": "unknown", "why": "purana bridge script, reload ho raha hai",
+                             "lvl": st["vpn"].get("lvl", ""), "mode": st["vpn"].get("mode", "")}
             st["vpn_t"] = rep["_t"]
             if old != (st["vpn"].get("state"), st["vpn"].get("country")):
                 log(f"vpn {p.directory}: {st['vpn'].get('state')} {st['vpn'].get('country', '')} ({st['vpn'].get('lvl', '')}/{st['vpn'].get('mode', '')})")
                 QTimer.singleShot(0, self.changed.emit)
         if rep.get("vpn_only"):
             st["t"] = rep["_t"]
-            st["vpn_fresh_t"] = rep["_t"]          # answer to vpn_check: a fresh IP / proxy look
+            if not old_script:     # an older script's answer is no fresh VPN look (Refresh shows Unknown)
+                st["vpn_fresh_t"] = rep["_t"]          # answer to vpn_check: a fresh IP / proxy look
             return False
         if rep.get("limit_result") is not None:      # answer to Check Limit: not a tab/state report
             st["t"] = rep["_t"]
@@ -473,7 +481,7 @@ class Controller(QObject):
             return False
         # an older bridge copy is running in this profile: ask it to reload itself (at most once a minute)
         checking = time.time() - st.get("checking", 0) < 60     # never reload the bridge in the middle of a Check Limit
-        stale = rep.get("ver") != EXT_VERSION or (rep.get("build") or "") != config.extension_build()
+        stale = old_script
         if any(d["tag"] == p.tag and d["status"] in ("queued", "sending") for d in self.dispatches.values()):
             stale = False         # never reload a bridge in the middle of a dispatch
         if rep.get("limit_result") is None and stale and not checking and time.time() - st.get("reload_asked", 0) > 60:

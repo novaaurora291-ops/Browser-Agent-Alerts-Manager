@@ -11,6 +11,7 @@ import math
 import time
 
 from PySide6.QtCore import Qt, QTimer, QSettings, QPoint, QRect
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QComboBox, QSlider, QSplitter,
                                QScrollArea, QScrollBar, QPushButton, QApplication)
 
@@ -53,6 +54,8 @@ class PaneHeader(QFrame):
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             self._press = e.globalPosition().toPoint()
+            if self.pane.hwnd:
+                self.pane.mv.kb_hwnd = self.pane.hwnd       # this pane is the one Ctrl+L (from the grid) goes to
             e.accept()
 
     def mouseMoveEvent(self, e):
@@ -261,6 +264,8 @@ class Pane(QFrame):
             self.failed = hwnd
             return
         self.hwnd = hwnd
+        # activatable inside the pane: a click in its address bar / Ctrl+L / typing reach THIS browser (set_activatable)
+        chrome.set_activatable(hwnd, True)
         self.fit()
         self.hark_tries, self.hark_next = 0, 0
         self.ask_hark()
@@ -275,7 +280,13 @@ class Pane(QFrame):
                 log(f"multiview {self.dir}: team Planner, its tab is left as it is (no show_hark)")
             self.hark_tries = 99
             return
-        if not self.hwnd or "hark" in chrome.window_title(self.hwnd).lower() or self.hark_tries >= 4:
+        if not self.hwnd or self.hark_tries >= 4:
+            return
+        if "hark" in chrome.window_title(self.hwnd).lower() or self.mv.kb_hwnd == self.hwnd \
+                or chrome.foreground() == self.hwnd:
+            # its Hark tab is in front, or the user works in this pane: done. A tab the user opens or picks later
+            # (Ctrl+T, a URL typed in the address bar) is never switched back to Hark behind their back.
+            self.hark_tries = 99
             return
         if p and self.hark_tries >= 2 and not getattr(self, "hark_opened", False):
             # an older bridge copy has no show_hark: open hark.com/chat; the browser puts it in this (hosted) window
@@ -307,6 +318,8 @@ class Pane(QFrame):
                 self.msg.setText("Browser window band ho gayi. Refresh dabayein.")
                 self.msg.show()
                 return
+            if not chrome.is_activatable(self.hwnd):
+                chrome.set_activatable(self.hwnd, True)
             self.keep_in_place()
             if time.time() > getattr(self, "hark_next", 0):
                 self.ask_hark()
@@ -494,6 +507,12 @@ class MultiView(QWidget):
         # them last gets them back when this window is activated again (Alt+Tab, taskbar) or after Expand/Collapse
         self.kb_hwnd = None
         EmbedFocus.install().listeners.append(self.on_embed_focus)
+        # Ctrl+L / Alt+D / F6 while the grid itself has the keys (a pane header, the top bar): the address bar of the
+        # pane worked in last (or whose header was clicked), never another pane's and never the Manager
+        for ks in ("Ctrl+L", "Alt+D", "F6"):
+            sc = QShortcut(QKeySequence(ks), self)
+            sc.setContext(Qt.WindowShortcut)
+            sc.activated.connect(self.focus_address_bar)
 
     # ---------- open / close ----------
     def open(self):
@@ -534,6 +553,14 @@ class MultiView(QWidget):
     def on_embed_focus(self, hwnd, ok):
         if any(p.hwnd == hwnd for p in self.panes):
             self.kb_hwnd = hwnd
+
+    def focus_address_bar(self):
+        p = next((p for p in self.panes if p.hwnd and p.hwnd == self.kb_hwnd and p.isVisible()), None)
+        if not p:
+            p = next((p for p in self.panes if p.hwnd and p.isVisible()), None)
+        if p and self.focus_pane(p):
+            QTimer.singleShot(80, lambda: chrome.foreground() == p.hwnd and chrome.press_ctrl("L"))
+            log(f"multiview Ctrl+L -> address bar of {p.dir}")
 
     def focus_pane(self, pane=None):
         """Keys to this pane's browser (default: the one that had them last), if it is shown in the grid."""
@@ -797,6 +824,9 @@ class MultiView(QWidget):
     def poll(self):
         for p in self.panes:
             p.poll()
+        fg = chrome.foreground()
+        if fg and any(p.hwnd == fg for p in self.panes):
+            self.kb_hwnd = fg            # the pane the user is working in (activated by a click in it)
         self.clip_popups()
         if time.time() - getattr(self, "_auto_t", 0) > 2:
             self._auto_t = time.time()

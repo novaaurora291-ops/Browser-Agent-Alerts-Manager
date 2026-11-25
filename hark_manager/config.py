@@ -272,12 +272,15 @@ def ensure_profile_extension(data_dir, tag):
         if os.path.isfile(s):
             d = os.path.join(dst, fn)
             try:
-                if not os.path.exists(d) or open(s, "rb").read() != open(d, "rb").read():
-                    shutil.copy2(s, d)
+                data = stamped(fn, open(s, "rb").read())
+                if not os.path.exists(d) or data != open(d, "rb").read():
+                    with open(d, "wb") as f:
+                        f.write(data)
             except Exception as e:
                 log(f"profile ext copy {fn}: {e}")
     t = os.path.join(dst, "tag.json")
-    want = json.dumps({"tag": tag, "token": bridge_token(tag), "build": extension_build()})
+    # no "build" here: the build a bridge reports is the one stamped into the script it actually runs (sw.js)
+    want = json.dumps({"tag": tag, "token": bridge_token(tag)})
     if not os.path.exists(t) or open(t, encoding="utf-8").read() != want:
         with open(t, "w", encoding="utf-8") as f:
             f.write(want)
@@ -285,6 +288,14 @@ def ensure_profile_extension(data_dir, tag):
 
 
 _BUILD = []
+_STAMP = b'const CODE_BUILD = "";'
+
+
+def stamped(fn, data):
+    """sw.js carries its own build (CODE_BUILD) so a running script reports what it really is, not what is on disk."""
+    if fn == "sw.js" and _STAMP in data:
+        return data.replace(_STAMP, b'const CODE_BUILD = "' + extension_build().encode() + b'";', 1)
+    return data
 
 
 def extension_build():
@@ -315,8 +326,10 @@ def ensure_extension():
         d = os.path.join(EXTENSION_DIR, fn)
         if os.path.isfile(s):
             try:
-                if not os.path.exists(d) or open(s, "rb").read() != open(d, "rb").read():
-                    shutil.copy2(s, d)
+                data = stamped(fn, open(s, "rb").read())
+                if not os.path.exists(d) or data != open(d, "rb").read():
+                    with open(d, "wb") as f:
+                        f.write(data)
             except Exception as e:
                 log(f"ext copy {fn}: {e}")
     return EXTENSION_DIR

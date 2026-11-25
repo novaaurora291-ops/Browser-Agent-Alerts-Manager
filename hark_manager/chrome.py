@@ -399,6 +399,8 @@ user32.GetFocus.restype = wintypes.HWND
 user32.GetAncestor.restype = wintypes.HWND
 user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
 user32.GetForegroundWindow.restype = wintypes.HWND
+user32.SetActiveWindow.restype = wintypes.HWND
+user32.SetActiveWindow.argtypes = [wintypes.HWND]
 user32.GetWindow.restype = wintypes.HWND
 user32.GetWindow.argtypes = [wintypes.HWND, ctypes.c_uint]
 user32.GetWindowThreadProcessId.restype = wintypes.DWORD
@@ -643,6 +645,47 @@ def _thread_focus(tid):
     return int(gi.hwndFocus or 0)
 
 
+def is_activatable(hwnd):
+    """A docked window that can be the active window (hosted without WS_CHILD, see set_activatable)."""
+    st = user32.GetWindowLongPtrW(hwnd, GWL_STYLE) & 0xFFFFFFFF
+    return bool(st) and not (st & WS_CHILD)
+
+
+def set_activatable(hwnd, on):
+    """Address / search bar in a Live Multi-View pane. A WS_CHILD window can never be the active window, and
+    Chrome's own UI (omnibox focus on a click, Ctrl+L / Alt+D / F6, typing and Ctrl+V into the omnibox) only works
+    while GetActiveWindow() is the browser window itself: clicking the bar or pressing Ctrl+L did nothing (only
+    typing into the page worked). on=True keeps the window parented to its pane (it moves, scrolls and is clipped
+    with the pane, no taskbar button) but drops WS_CHILD, so a click in it activates THAT browser window like a
+    normal window and every other pane, and the Manager, become inactive. on=False: a plain child window again."""
+    import win32gui
+    import win32con
+    if not is_window(hwnd):
+        return False
+    st = user32.GetWindowLongPtrW(hwnd, GWL_STYLE) & 0xFFFFFFFF
+    new = ((st & ~WS_CHILD) | WS_POPUP) if on else ((st & ~WS_POPUP) | WS_CHILD)
+    if new != st:
+        user32.SetWindowLongPtrW(hwnd, GWL_STYLE, new)
+        win32gui.SetWindowPos(hwnd, 0, 0, 0, 0, 0, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOZORDER
+                              | win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED)
+    return True
+
+
+def foreground():
+    return int(user32.GetForegroundWindow() or 0)
+
+
+def press_ctrl(key):
+    """Ctrl+<key> to whatever window has the keyboard now (SendInput through keybd_event)."""
+    VK_CONTROL, KEYUP = 0x11, 0x0002
+    vk = ord(key.upper())
+    ke = ctypes.windll.user32.keybd_event
+    ke(VK_CONTROL, 0, 0, 0)
+    ke(vk, 0, 0, 0)
+    ke(vk, 0, KEYUP, 0)
+    ke(VK_CONTROL, 0, KEYUP, 0)
+
+
 def focus_embedded(hwnd):
     """Give the keyboard focus to a docked Cent window. A docked window is a WS_CHILD of our (Qt) window in
     another process: a click in it never moves the Win32 focus there (Chrome does not SetFocus itself, it waits
@@ -651,9 +694,28 @@ def focus_embedded(hwnd):
     if not is_window(hwnd):
         return False
     root = user32.GetAncestor(hwnd, 2)            # GA_ROOT: our window that hosts it
-    if not root or user32.GetForegroundWindow() != root:
+    fg = user32.GetForegroundWindow()
+    # ours in the foreground: the hosting window itself, or one of its activatable docked browser windows
+    if not root or not fg or (fg != root and user32.GetAncestor(fg, 2) != root):
         return False
     tid = user32.GetWindowThreadProcessId(hwnd, None)
+    if is_activatable(hwnd):
+        # a Multi-View pane: make THIS browser window the active one (its omnibox, Ctrl+L and typing then work)
+        if fg == hwnd:
+            return True
+        user32.SetActiveWindow(hwnd)
+        if user32.GetForegroundWindow() != hwnd:
+            me = ctypes.windll.kernel32.GetCurrentThreadId()
+            try:
+                if user32.AttachThreadInput(me, tid, True):
+                    user32.SetActiveWindow(hwnd)
+                    user32.AttachThreadInput(me, tid, False)
+            except Exception as e:
+                log(f"focus_embedded {hwnd}: {e}")
+        ok = user32.GetForegroundWindow() == hwnd
+        if not ok:
+            log(f"focus_embedded {hwnd}: the pane's browser window did not become active")
+        return ok
 
     def has_focus():
         f = _thread_focus(tid)
@@ -756,8 +818,10 @@ def unclip_popups(popups=None):
 
 
 def reparent(hwnd, parent):
-    """Move an already hosted browser window from one of our host widgets to another (no style change)."""
+    """Move an already hosted browser window from one of our host widgets to another. It always arrives as a plain
+    child window (WS_CHILD); a Live Multi-View pane makes its own window activatable again (set_activatable)."""
     import win32gui
     import win32con
+    set_activatable(hwnd, False)
     user32.SetParent(hwnd, parent)
     win32gui.SetWindowPos(hwnd, 0, 0, 0, 0, 0, win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_SHOWWINDOW)
