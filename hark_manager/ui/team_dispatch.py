@@ -254,6 +254,18 @@ class TeamDispatchPanel(QWidget):
         a = alias.lower()
         b, w = self.blocks.get(a), self.worker(alias)
         d = self.disp.get(a)
+        if not d and w and b:
+            # this exact prompt went out before (this session or before a restart): show its own result
+            prev = self.ctl.already_sent(w["profile_id"], w["project_url"], self._prompt(alias))
+            if prev and prev["status"] not in self.ctl.RETRYABLE:
+                d = prev
+        if d and d["status"] in self.ctl.RETRYABLE:
+            # confirmed NOT sent: a fresh Tab Verified after that failure makes it Ready again (retry)
+            v = self.verify.get(a) or {}
+            if not (v.get("ok") and v.get("at", 0) > d.get("done", d.get("t", 0))):
+                why = d.get("reason") or d["status"]
+                return "block", f"\u26A0 Blocked ({why}; Verify tabs = retry)", False
+            d = None
         if d:
             st, why = d["status"], d.get("reason") or ""
             return {"queued": ("run", "\u23F3 Sending\u2026", False), "sending": ("run", "\u23F3 Sending\u2026", False),
@@ -271,9 +283,6 @@ class TeamDispatchPanel(QWidget):
         wt = self.ctl.worktrees_ok.get(w["alias"])
         if wt and not wt[0]:
             return "block", f"\u26A0 Blocked (Worktree: {wt[1]})", False
-        prev = self.ctl.already_sent(w["profile_id"], w["project_url"], self._prompt(alias))
-        if prev and prev["status"] not in ("blocked", "expired"):
-            return "warn", f"Already dispatched ({prev['status']})", False
         v = self.verify.get(a)
         if not v:
             return "info", "Checking tab\u2026", False

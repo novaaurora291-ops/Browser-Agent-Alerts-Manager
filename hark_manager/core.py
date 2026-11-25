@@ -83,6 +83,7 @@ class Controller(QObject):
         self.dispatches = {}  # dispatch id -> record (Safe Dispatch)
         self.sent_keys = {}   # (tag, url, sha256(prompt)) -> dispatch id: the same prompt is never sent twice
         self.worktrees_ok = {}  # alias -> (ok, reason) from the last git check
+        self._load_dispatches()  # Sent / Unconfirmed survive a restart: the same prompt is never sent twice
         self.cent_error = ""
         self.fr = {}          # last Profiles-page Refresh: {"t0", "end", "running", "res": {dir: {check: value}}}
         self.profiles = []
@@ -1005,7 +1006,7 @@ class Controller(QObject):
         import uuid
         key = self.prompt_key(tag, url, text)
         prev = self.sent_keys.get(key)
-        if prev and self.dispatches.get(prev, {}).get("status") not in ("blocked", "expired"):
+        if prev and self.dispatches.get(prev, {}).get("status") not in self.RETRYABLE:
             log(f"dispatch {alias}: refused, same prompt already dispatched ({prev[:8]})")
             return None
         if not repo_team.PROJECT_URL_RE.match(url or "") or tab_id is None:
@@ -1066,10 +1067,43 @@ class Controller(QObject):
     def _dispatch_log(self, rec):
         import json
         try:
+            # "key" = profile|project URL|sha256(prompt): no prompt text, but it lets a restart restore the record
             with open(os.path.join(config.APPDATA, "dispatch_log.jsonl"), "a", encoding="utf-8") as f:
-                f.write(json.dumps({k: v for k, v in rec.items() if k != "key"}) + "\n")
+                f.write(json.dumps(rec) + "\n")
         except Exception:
             pass
+
+    RETRYABLE = ("blocked", "expired")   # confirmed NOT typed into the page: the same prompt may be dispatched again
+
+    def _load_dispatches(self):
+        """Rebuild dispatches + sent_keys from dispatch_log.jsonl (last line per dispatch ID wins).
+        A dispatch still queued/sending when the Manager stopped is restored as Unconfirmed (never re-sent)."""
+        import json
+        path = os.path.join(config.APPDATA, "dispatch_log.jsonl")
+        last = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(r, dict) and r.get("id") and r.get("key"):
+                        last[r["id"]] = r
+        except OSError:
+            return
+        for did, r in sorted(last.items(), key=lambda x: x[1].get("t", 0)):
+            if r.get("status") in ("queued", "sending"):
+                r["status"], r["reason"] = "unconfirmed", "Manager restarted before the page confirmed it (not re-sent)"
+            r["restored"] = True
+            self.dispatches[did] = r
+            prev = self.sent_keys.get(r["key"])
+            # a key keeps its non-retryable record: a later blocked retry never hides an earlier Sent
+            if not prev or self.dispatches.get(prev, {}).get("status") in self.RETRYABLE:
+                self.sent_keys[r["key"]] = did
+        if last:
+            log(f"dispatch log: {len(last)} earlier dispatch(es) restored, "
+                f"{sum(1 for d in self.sent_keys.values() if self.dispatches[d]['status'] not in self.RETRYABLE)} not re-sendable")
 
     def _write_snapshot(self):
         """Live tabs per managed profile (no secrets, no page text) for troubleshooting: bridge_state.json."""
