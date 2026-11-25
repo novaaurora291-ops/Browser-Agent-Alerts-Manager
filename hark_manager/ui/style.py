@@ -31,6 +31,7 @@ QFrame#cardAlert {{ background: {CARD}; border: 2px solid {ORANGE}; border-radiu
 QPushButton#primary {{ background: {LIME}; color: {TEXT}; border: none; border-radius: 9px; padding: 9px 18px; font-size: 15px; font-weight: 600; }}
 QPushButton#primary:hover {{ background: #8FE01F; }}
 QPushButton#primary:pressed {{ background: #7ccc12; }}
+QPushButton#primary:disabled {{ background: {LIME_SOFT}; color: {GRAY}; }}
 QPushButton#outline {{ background: {CARD}; border: 1.5px solid {LIME_BORDER}; border-radius: 9px; padding: 7px 14px; font-size: 14px; font-weight: 600; }}
 QPushButton#outline:hover {{ background: {LIME_SOFT}; }}
 QPushButton#outline:disabled {{ border-color: {BORDER}; color: {GRAY}; }}

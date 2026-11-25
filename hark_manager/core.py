@@ -2,7 +2,7 @@
 import threading
 import os
 import time
-EXT_VERSION = "1.0.17"   # must equal extension/manifest.json "version"
+EXT_VERSION = "1.0.18"   # must equal extension/manifest.json "version"
 ALERT_GRACE = 15  # an alert Hark no longer shows as waiting (live DOM) is cleared after this many seconds
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -794,6 +794,11 @@ class Controller(QObject):
             self.fr["cid"][cid] = p.directory
             self.bridge.queue_command(key, {"type": "rescan"})
             self.bridge.queue_command(key, {"type": "vpn_check"})
+            if self.is_planner(p):
+                # the Shared Repo Team's Planner works in ChatGPT: no Hark limit to read, and the probe would
+                # open a hark.com tab in it (and wait the whole timeout). Its result is "planner", not Unknown.
+                self.fr["res"][p.directory]["limit"] = {"id": cid, "planner": True, "tabs": []}
+                continue
             self.check_limit(p, cid)
         # closed profiles: nothing can be running there
         for p in self.profiles:
@@ -866,7 +871,7 @@ class Controller(QObject):
             out[d] = {"name": p.name if p else d, "vpn": r["vpn"] if r["vpn"] == "unknown" else "/".join(x for x in r["vpn"] if x),
                       "activity": r["activity"], "limit": lim}
             log(f"refresh result {out[d]['name']}: vpn={out[d]['vpn']} activity={r['activity']} "
-                f"limit={'unknown' if lim == 'unknown' else 'answered'}")
+                f"limit={'unknown' if lim == 'unknown' else ('planner (skipped)' if isinstance(lim, dict) and lim.get('planner') else 'answered')}")
         log(f"refresh done in {fr['end'] - fr['t0']:.1f}s: {sum(1 for r in fr['res'].values() if 'unknown' in (r['vpn'], r['activity'], r['limit']))} profile(s) with Unknown")
         self.changed.emit()
         self.refresh_done.emit(out)

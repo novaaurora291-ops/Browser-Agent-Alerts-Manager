@@ -641,6 +641,8 @@ class ProfilesPage(QWidget):
         for k, r in out.items():
             if r["limit"] == "unknown":
                 self.set_result(k, "info", "Limit: Unknown", "Is Refresh mein jawab nahi aaya")
+            elif isinstance(r["limit"], dict) and r["limit"].get("planner"):
+                self.set_result(k, "info", "Planner (ChatGPT)", "Hark limit check skip")
             if "unknown" in (r["vpn"], r["activity"], r["limit"]):
                 unk += 1
         counts = {}
@@ -756,6 +758,11 @@ class ProfilesPage(QWidget):
         pid, wids = self.ctl.team_profile_ids()
         team_here = mode == "grid" and any(getattr(w, "p", None) is not None and w.p.tag in wids + [pid] for w in self.items.values())
         self.grid.setVerticalSpacing(74 if team_here else 18)   # room for the repo badge between rows
+        # no Planner card in view (closed / filtered): the badge sits above the first worker row, so that row
+        # needs room above it too, otherwise the badge covers the top cards' names
+        planner_here = any(getattr(w, "p", None) is not None and w.p.tag == pid for w in self.items.values())
+        m = self.grid.contentsMargins()
+        self.grid.setContentsMargins(m.left(), 64 if team_here and not planner_here else 0, m.right(), m.bottom())
         QTimer.singleShot(0, self.overlay.sync)
 
     def _team_cells(self, ps):

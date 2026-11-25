@@ -234,17 +234,25 @@ async function runCommands(cmds) {
 // when a VPN extension holds it, the country of the public IP this profile's traffic actually leaves from.
 const IPS = [["https://api.country.is/", "country"], ["https://ipinfo.io/json", "country"], ["https://ipwho.is/", "country_code"], ["https://ipapi.co/json/", "country_code"]];
 let vpnCache = { key: "", country: "", at: 0 };
+let vpnGood = { key: "", country: "", at: 0 };   // last country a check really got, for this proxy key
+let ipBusy = null;                               // one IP lookup at a time: parallel reports share it
 async function ipCountry() {
   for (const [u, k] of IPS) {
+    const ac = new AbortController(); const tm = setTimeout(() => ac.abort(), 6000);
     try {
-      const ac = new AbortController(); const tm = setTimeout(() => ac.abort(), 6000);
-      const r = await fetch(u, { cache: "no-store", signal: ac.signal }); clearTimeout(tm);
+      const r = await fetch(u, { cache: "no-store", signal: ac.signal });
       if (!r.ok) continue;
-      const c = ((await r.json())[k] || "").toUpperCase();
+      const c = ((await r.json())[k] || "").toUpperCase();   // the body read is inside the 6 s abort too
       if (/^[A-Z]{2}$/.test(c)) return c;
-    } catch (e) {}
+    } catch (e) {
+    } finally { clearTimeout(tm); }
   }
   return "";
+}
+function ipCountryOnce() {
+  // never more than 30 s: a lookup that hangs must not hold every later report (they share this promise)
+  if (!ipBusy) ipBusy = Promise.race([ipCountry(), sleep(30000).then(() => "")]).finally(() => { ipBusy = null; });
+  return ipBusy;
 }
 async function vpnState(force) {
   let ps;
@@ -254,13 +262,23 @@ async function vpnState(force) {
   // (Browsec). Its level reads "controllable_by_this_extension" (not "controlled_by_other_extensions") once the
   // bridge was (re)loaded after the VPN: Chrome ranks the newest-installed extension first.
   const held = lvl === "controlled_by_other_extensions" || lvl === "controllable_by_this_extension" || lvl === "controlled_by_this_extension";
-  if (!held || !(mode === "pac_script" || mode === "fixed_servers")) { vpnCache = { key: "", country: "", at: 0 }; return { state: "off", lvl, mode, at: Date.now() }; }
+  if (!held || !(mode === "pac_script" || mode === "fixed_servers")) { vpnCache = { key: "", country: "", at: 0 }; vpnGood = { key: "", country: "", at: 0 }; return { state: "off", lvl, mode, at: Date.now() }; }
   const key = lvl + "|" + mode;
   if (force || vpnCache.key !== key || Date.now() - vpnCache.at > 180000 || !vpnCache.country) {
-    vpnCache = { key, country: await ipCountry(), at: Date.now() };
+    // a failed re-check right after a good one (one IP service timing out through the VPN) must not flip
+    // the badge to Unknown and back: retry soon, keep the last good country (same proxy key, < 5 min old).
+    // A forced check (Manager Refresh) reports exactly what it got.
+    if (!force && vpnCache.key === key && !vpnCache.country && Date.now() - vpnCache.at < 20000 && vpnGood.key === key) {
+      // a failed lookup a moment ago: do not hammer the IP services on every report
+    } else {
+      vpnCache = { key, country: await ipCountryOnce(), at: Date.now() };
+      if (vpnCache.country) vpnGood = { key, country: vpnCache.country, at: vpnCache.at };
+    }
   }
-  return vpnCache.country ? { state: "on", country: vpnCache.country, lvl, mode, at: vpnCache.at }
-                          : { state: "unknown", why: "ip check failed", lvl, mode, at: vpnCache.at };
+  if (vpnCache.country) return { state: "on", country: vpnCache.country, lvl, mode, at: vpnCache.at };
+  if (!force && vpnGood.key === key && vpnGood.country && Date.now() - vpnGood.at < 300000)
+    return { state: "on", country: vpnGood.country, lvl, mode, at: vpnGood.at, held_last: true };
+  return { state: "unknown", why: "ip check failed", lvl, mode, at: vpnCache.at };
 }
 try { chrome.proxy.settings.onChange.addListener(() => { vpnCache.at = 0; report().catch(() => {}); }); } catch (e) {}
 async function report(extra) {
