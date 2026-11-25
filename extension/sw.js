@@ -244,7 +244,10 @@ async function vpnState(force) {
   let ps;
   try { ps = await chrome.proxy.settings.get({ incognito: false }); } catch (e) { return { state: "unknown", why: "proxy api" }; }
   const lvl = ps.levelOfControl || "", mode = (ps.value || {}).mode || "";
-  const held = lvl === "controlled_by_other_extensions";
+  // the bridge never sets a proxy itself, so a pac/fixed proxy that policy does not hold is a VPN extension's
+  // (Browsec). Its level reads "controllable_by_this_extension" (not "controlled_by_other_extensions") once the
+  // bridge was (re)loaded after the VPN: Chrome ranks the newest-installed extension first.
+  const held = lvl === "controlled_by_other_extensions" || lvl === "controllable_by_this_extension" || lvl === "controlled_by_this_extension";
   if (!held || !(mode === "pac_script" || mode === "fixed_servers")) { vpnCache = { key: "", country: "", at: 0 }; return { state: "off", lvl, mode, at: Date.now() }; }
   const key = lvl + "|" + mode;
   if (force || vpnCache.key !== key || Date.now() - vpnCache.at > 180000 || !vpnCache.country) {
