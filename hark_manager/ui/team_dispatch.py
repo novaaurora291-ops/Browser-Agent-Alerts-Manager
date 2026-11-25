@@ -201,6 +201,9 @@ class TeamDispatchPanel(QWidget):
         self.refresh_cards()
 
     def parse(self):
+        if self.busy:
+            self.t_parse.start()       # a Dispatch is running: apply the new plan text once it has finished
+            return
         t = self.team()
         aliases = [w["alias"] for w in t.get("workers") or []]
         blocks, issues = repo_team.parse_plan(self.paste.toPlainText(), aliases)
@@ -237,8 +240,9 @@ class TeamDispatchPanel(QWidget):
             c = WorkerCard(self, w["alias"])
             self.cards[w["alias"].lower()] = c
             self.list.addWidget(c)
+        planner_alias = ((self.team().get("planner") or {}).get("alias") or "").lower()
         for a, b in self.blocks.items():
-            if not b["known"]:
+            if not b["known"] and a != planner_alias:      # the Planner's own block is never a worker card
                 c = WorkerCard(self, b["alias"])
                 self.cards[a] = c
                 self.list.addWidget(c)
@@ -307,10 +311,14 @@ class TeamDispatchPanel(QWidget):
         self.ready = ready
         self.b_send.setText(f"\U0001F680 Dispatch to Verified Agents ({ready} Ready)" if not self.busy else "\u23F3 Dispatching\u2026")
         self.b_send.setEnabled(ready > 0 and not self.busy)
+        self.b_verify.setEnabled(not self.busy)
+        self.paste.setReadOnly(self.busy)          # the plan is frozen while it is being dispatched
         self.b_send.setAccessibleName(f"Dispatch to Verified Agents ({ready} Ready)" + (" busy" if self.busy else ""))
 
     # ---------- tab checks ----------
     def verify_all(self, purpose="show"):
+        if self.busy:
+            return            # a Dispatch is checking its tabs: a second check would replace its fresh one
         if repo_team.is_configured(self.team()):
             threading.Thread(target=self._check_wt, daemon=True).start()     # worktrees too, fresh
         for w in self.team().get("workers") or []:
@@ -344,6 +352,9 @@ class TeamDispatchPanel(QWidget):
         self.b_send.setEnabled(False)
         self.b_send.setText("\u23F3 Dispatching\u2026")
         cand = [a for a, c in self.cards.items() if self.status_of(c.alias)[2]]
+        self._snap = {a: self._prompt(a) for a in cand}      # exactly what the preview showed at this click
+        self.paste.setReadOnly(True)
+        self.b_verify.setEnabled(False)
         log(f"dispatch click: {len(cand)} candidate(s) {cand}")
         self._set_foot("Worktrees aur tabs dobara verify ho rahe hain\u2026")
         threading.Thread(target=self._recheck_wt, args=(cand,), daemon=True).start()
@@ -374,7 +385,7 @@ class TeamDispatchPanel(QWidget):
             v, w = self._fresh.get(a) or {}, self.worker(a)
             if not v.get("ok") or not w:
                 continue
-            text = self._prompt(a)
+            text = (getattr(self, "_snap", None) or {}).get(a) or ""     # the prompt previewed at the click
             if not text:
                 continue
             rec = self.ctl.send_prompt(w["profile_id"], v["tab_id"], w["project_url"], text, w["alias"])
@@ -404,6 +415,7 @@ class TeamDispatchPanel(QWidget):
 
     def _finish(self, msg):
         self.busy = False
+        self._snap = {}
         self._set_foot(msg)
         log(f"dispatch finished: {msg}")
         self.refresh_cards()
