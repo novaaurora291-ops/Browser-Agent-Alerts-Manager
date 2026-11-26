@@ -184,6 +184,8 @@ class Pane(QFrame):
         self.hwnd = None
         self.hark_tries, self.hark_next = 0, 0
         self.deadline = time.time() + 25
+        self.gone = False         # its browser was closed and the profile has no other window: the grid drops it
+        self.lost_at = 0          # when its window closed (a short grace to pick up another window of the profile)
         self.setObjectName("pane")
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -314,8 +316,9 @@ class Pane(QFrame):
             if not chrome.is_window(self.hwnd):
                 self.mv.dock.forget(self.hwnd)
                 self.hwnd = None
+                self.lost_at = time.time()
                 self.host.hide()
-                self.msg.setText("Browser window band ho gayi. Refresh dabayein.")
+                self.msg.setText("Browser window band ho gayi\u2026")
                 self.msg.show()
                 return
             if not chrome.is_activatable(self.hwnd):
@@ -335,7 +338,13 @@ class Pane(QFrame):
                 and w[0] != getattr(self, "failed", None)]
         if wins:
             hark = [w for w in wins if "hark" in (w[1] or "").lower()]
+            self.lost_at = 0
             return self.take((hark or wins)[0][0])
+        # closed by the user (or never came up): no window of this profile left -> the pane goes
+        if (self.lost_at and time.time() - self.lost_at > 0.6) or time.time() > self.deadline:
+            if not any(chrome.is_window(w[0]) for w in chrome.windows_for(p)):
+                self.gone = True
+                return
         if time.time() > self.deadline:
             self.msg.setText("Window nahi mili. Profile launch karke Refresh dabayein.")
         else:
@@ -710,6 +719,8 @@ class MultiView(QWidget):
             data = None
         def apply(s, fr):
             n = s.count()
+            if not n:
+                return          # empty grid (last window closed): nothing to size
             if not fr or len(fr) != n:
                 fr = [1 / n] * n
             tot = (s.height() if s.orientation() == Qt.Vertical else s.width()) or 1000
@@ -824,6 +835,8 @@ class MultiView(QWidget):
     def poll(self):
         for p in self.panes:
             p.poll()
+        if self.drop_closed():
+            return
         fg = chrome.foreground()
         if fg and any(p.hwnd == fg for p in self.panes):
             self.kb_hwnd = fg            # the pane the user is working in (activated by a click in it)
@@ -832,11 +845,22 @@ class MultiView(QWidget):
             self._auto_t = time.time()
             self.auto_add()
 
+    def drop_closed(self):
+        """Panes whose Cent window was closed go at once; the rest re-tile, and the counts update."""
+        gone = [p.dir for p in self.panes if p.gone]
+        if not gone:
+            return False
+        left = [p.dir for p in self.panes if not p.gone]
+        log(f"multiview: closed window(s) dropped {gone}, {len(left)} pane(s) left")
+        self.build(left)                       # grid re-arranged for the new count + title "(N Open Profiles)"
+        self.ctl.refresh_windows()             # main window Open Profiles count / cards follow
+        return True
+
     def auto_add(self):
         """A Cent profile launched (or a docked one) while the grid is open gets its own pane automatically."""
         cur = [p.dir for p in self.panes]
         new = [p.directory for p in self.ctl.profiles if p.directory not in cur and p.directory not in self.ctl.no_dock
-               and (any(not self.dock.has(w[0]) and w[0] not in self.dock.released for w in self.ctl.windows.get(p.directory) or [])
+               and (any(not self.dock.has(w[0]) and w[0] not in self.dock.released and chrome.is_window(w[0]) for w in self.ctl.windows.get(p.directory) or [])
                     or self.dock.window_of(p.directory, "park"))]
         if new:
             log(f"multiview auto-add: {new}")
