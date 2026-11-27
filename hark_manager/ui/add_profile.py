@@ -1,14 +1,17 @@
+from datetime import date
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 import re
 
 from PySide6.QtCore import QTimer, Signal
-from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QFrame, QWidget,
+from PySide6.QtWidgets import (QDialog, QInputDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QFrame, QWidget,
                                QButtonGroup, QComboBox, QPlainTextEdit, QScrollArea, QSizePolicy)
 
 from . import icons
 from .widgets import label, button
 from .style import LIME, LIME_SOFT, LIME_BORDER, BORDER, MUTED, GREEN
+from .. import config
 from .. import chrome as chrome_mod
 from ..setup import ProfileSetup, parse_dob
 
@@ -148,6 +151,7 @@ class AddProfileDialog(QDialog):
         self.running = False
         self.finished_all = False
         self._pws = {}          # email -> password, only while the dialog lives; each is dropped once used
+        self._filled_dob_for = ()
         self.queue = []
         self.setWindowTitle("Add profile")
         from .style import build_qss
@@ -295,11 +299,18 @@ class AddProfileDialog(QDialog):
 
         self.l_dob = fl("Birthday (agar Hark poochhe)")
         form.addWidget(self.l_dob)
-        self.dob = QLineEdit(str(self.ctl.settings.get("signin_dob") or ""))
+        self.dob = QLineEdit()
         self.dob.setPlaceholderText("YYYY-MM-DD · Hark ke age check par khud fill hoga")
         self.dob.setAccessibleName("Birthday")
         self.dob.textChanged.connect(self._validate)
-        form.addWidget(self.dob)
+        self.dob.textEdited.connect(self._use_manual_dob)
+        self.b_fill_dob = button("Auto-fill date", "outline")
+        self.b_fill_dob.setAutoDefault(False)
+        self.b_fill_dob.clicked.connect(self._fill_dob)
+        dob_row = QHBoxLayout()
+        dob_row.addWidget(self.dob, 1)
+        dob_row.addWidget(self.b_fill_dob)
+        form.addLayout(dob_row)
 
         self.l_manual = label("Manual: har profile mein Hark ka sign-in page khul jayega, login aap khud karenge.", wrap=True, color=MUTED)
         form.addWidget(self.l_manual)
@@ -391,6 +402,7 @@ class AddProfileDialog(QDialog):
         bh.addWidget(self.cancel)
         bh.addWidget(self.create)
         root.addLayout(bh)
+        self.email.textChanged.connect(self._clear_stale_dob)
         self._mode()
 
     # ---------- form state ----------
@@ -412,8 +424,9 @@ class AddProfileDialog(QDialog):
         for w in (self.l_paste, self.l_paste_hint, self.paste, self.ready):
             w.setVisible(auto and multi)
         self.l_manual.setVisible(not auto)
-        for w in (self.l_dob, self.dob):
+        for w in (self.l_dob, self.dob, self.b_fill_dob):
             w.setVisible(auto)
+        self._clear_stale_dob()
         self.b_auto.setIcon(icons.icon("radioon" if auto else "radio", 20))
         self.b_manual.setIcon(icons.icon("radio" if auto else "radioon", 20))
         self.steps_title.setText("Setup per profile" if multi else "Setup order")
@@ -456,6 +469,7 @@ class AddProfileDialog(QDialog):
             b = self.paste.document().findBlockByNumber(min(blk, self.paste.document().blockCount() - 1))
             c.setPosition(b.position() + min(len(b.text()), max(col, len(b.text()) if "|" in b.text() else col)))
             self.paste.setTextCursor(c)
+        self._clear_stale_dob()
         self._validate()
 
     def accounts(self):
@@ -475,6 +489,48 @@ class AddProfileDialog(QDialog):
             emails.add(em.lower())
             good.append(em)
         return good, bad
+
+    def _dob_accounts(self):
+        if self.multi():
+            emails, bad = self.accounts()
+            return tuple(sorted(email.lower() for email in emails)) if not bad else ()
+        email = self.email.text().strip().lower()
+        return (email,) if EMAIL_RE.fullmatch(email) else ()
+
+    def _use_manual_dob(self):
+        self._filled_dob_for = ()
+
+    def _clear_stale_dob(self):
+        if self._filled_dob_for and self._filled_dob_for != self._dob_accounts():
+            self._filled_dob_for = ()
+            self.dob.clear()
+
+    def _fill_dob(self):
+        emails = self._dob_accounts()
+        if not emails:
+            self.msg.setText("Pehle valid account email enter karein.")
+            return
+        saved = {parse_dob(config.get_secret(f"signin_dob:{email}")) for email in emails}
+        if len(saved - {None}) > 1:
+            self.msg.setText("In accounts ki saved birthdays alag hain. Single profile se fill karein.")
+            return
+        if None in saved:
+            current = self.dob.text().strip() or str(self.ctl.settings.get("signin_dob") or "")
+            value, ok = QInputDialog.getText(
+                self, "Confirm birthday", "Selected account(s) ki sahi DOB confirm karein (YYYY-MM-DD).",
+                text=current if parse_dob(current) else "",
+            )
+            if not ok:
+                return
+            birthday = parse_dob(value)
+            if not birthday:
+                self.msg.setText("Sahi birthday YYYY-MM-DD format mein likhein.")
+                return
+        else:
+            birthday = saved.pop()
+        self._filled_dob_for = emails
+        self.dob.setText(date(*birthday).isoformat())
+        self.msg.clear()
 
     def _validate(self):
         if self.running or self.finished_all:
@@ -589,7 +645,7 @@ class AddProfileDialog(QDialog):
         self.prog.setVisible(True)
         self.running = True
         self.mode_str = "auto" if auto else "manual"
-        self.dob_val = self._save_dob()
+        self.dob_val = self._save_dob(email for _, email in jobs)
         self.create.setEnabled(False)
         self.create.setText("Setting up…")
         self.cancel.setVisible(False)
@@ -604,16 +660,19 @@ class AddProfileDialog(QDialog):
                          if self.running else self.msg.text())
         self.busy.emit(done, len(self.jobs)) if self.running else None
 
-    def _save_dob(self):
-        """Remember the batch birthday for next time (only a date, used for Hark's age check)."""
-        v = self.dob.text().strip() if self.auto() else ""
-        if v and parse_dob(v) and self.ctl.settings.get("signin_dob") != v:
+    def _save_dob(self, emails):
+        birthday = parse_dob(self.dob.text()) if self.auto() else None
+        if not birthday:
+            return ""
+        value = date(*birthday).isoformat()
+        for email in emails:
+            if not EMAIL_RE.fullmatch(email):
+                continue
             try:
-                self.ctl.settings["signin_dob"] = v
-                self.ctl.settings.save()
+                config.set_secret(f"signin_dob:{email.lower()}", value)
             except Exception:
-                pass
-        return v
+                config.log("Birthday could not be saved in Credential Manager")
+        return value
 
     def stop_job(self, job):
         """Cancel only this job: a queued one is dropped, a running one stops at its next step."""
