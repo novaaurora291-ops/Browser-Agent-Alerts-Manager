@@ -49,6 +49,17 @@
     });
     return out;
   }
+  // the projects this Hark account shows in its sidebar (id + title), so the Manager can offer exact project URLs
+  function projectList() {
+    const out = [], seen = {};
+    document.querySelectorAll("[data-project-id]").forEach(el => {
+      const id = el.getAttribute("data-project-id");
+      if (!id || seen[id] || out.length >= 40) return;
+      seen[id] = 1;
+      out.push({ id, title: (txt(el).split("\n")[0] || "").slice(0, 60) });
+    });
+    return out;
+  }
   function shown(el) {
     if (!el || !el.isConnected) return false;
     for (let a = el, i = 0; a && i < 6; a = a.parentElement, i++) {
@@ -77,7 +88,7 @@
   }
   window.__harkDetect = function () {
     const list = document.querySelector("[data-testid=message-list]");
-    const base = { pending: false, working: false, convTitle: convTitle(), convKey: convKey(), hasList: !!list, running: runningProjects() };
+    const base = { pending: false, working: false, convTitle: convTitle(), convKey: convKey(), hasList: !!list, running: runningProjects(), projects: projectList() };
     if (!list) return base;
     const entries = Array.from(list.querySelectorAll("[data-entry-kind]")).filter(e => !e.parentElement.closest("[data-entry-kind]"));
     const why = liveRun();
@@ -138,23 +149,77 @@
     last = key;
     try { if (window.__hbmLoaded !== HBM_VER) return; chrome.runtime.sendMessage({ type: "hark_state", state: st }); } catch (e) {}
   }
+  // ---- Safe Dispatch: type one prompt into THIS tab's empty composer and confirm a new user message appears ----
+  const norm = s => (s || "").replace(/\s+/g, " ").trim();
+  function composer() {
+    return document.querySelector("textarea[data-testid=chat-input]") ||
+      Array.from(document.querySelectorAll("textarea, [contenteditable=true], [role=textbox]")).find(e => shown(e) && e.getBoundingClientRect().width > 80);
+  }
+  function edValue(ed) { return ed ? (ed.tagName === "TEXTAREA" ? ed.value : (ed.innerText || "")) : ""; }
+  function userEntries() {
+    const list = document.querySelector("[data-testid=message-list]");
+    if (!list) return [];
+    return Array.from(list.querySelectorAll("[data-entry-kind]")).filter(e => !e.parentElement.closest("[data-entry-kind]") && isUser(e));
+  }
+  function setValue(ed, text) {
+    ed.focus();
+    if (ed.tagName === "TEXTAREA") {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
+      setter.call(ed, text); ed.dispatchEvent(new Event("input", { bubbles: true }));
+    } else {
+      document.execCommand("selectAll", false, null);
+      document.execCommand("insertText", false, text);
+    }
+  }
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  window.__hbmSentIds = window.__hbmSentIds || {};
+  async function hbmSend(msg) {
+    if (!msg.dispatch_id) return { status: "blocked", reason: "no dispatch ID" };
+    if (window.__hbmSentIds[msg.dispatch_id]) return { status: "duplicate", reason: "already sent in this tab" };
+    if (location.href.split("#")[0] !== msg.url) return { status: "blocked", reason: "Tab URL changed" };
+    if (/sign-?in|login/i.test(location.pathname)) return { status: "blocked", reason: "Not signed in" };
+    const ed = composer();
+    if (!ed || !shown(ed)) return { status: "blocked", reason: "Composer not found" };
+    if (ed.disabled || ed.readOnly || ed.getAttribute("aria-disabled") === "true") return { status: "blocked", reason: "Composer not ready" };
+    if (norm(edValue(ed))) return { status: "blocked", reason: "Composer not empty" };
+    if (liveRun().length) return { status: "blocked", reason: "Agent running" };
+    window.__hbmSentIds[msg.dispatch_id] = Date.now();
+    const before = userEntries();
+    const beforeIds = new Set(before.map(e => e.getAttribute("data-message-id") || e.getAttribute("data-entry-id") || ""));
+    const nBefore = before.length;
+    setValue(ed, msg.text);
+    await wait(350);
+    if (norm(edValue(ed)) !== norm(msg.text)) { setValue(ed, ""); return { status: "blocked", reason: "Text insert failed (composer cleared)" }; }
+    if (location.href.split("#")[0] !== msg.url) { setValue(ed, ""); return { status: "blocked", reason: "Tab URL changed" }; }
+    let btn = null;
+    for (let i = 0; i < 20 && !btn; i++) {
+      // the send button of THIS composer (its form, or the closest box around it), never another "Send" on the page
+      let scope = ed.closest("form");
+      for (let a = ed.parentElement, k = 0; !scope && a && k < 6; a = a.parentElement, k++) if (a.querySelector("button[aria-label]")) scope = a;
+      btn = Array.from((scope || document).querySelectorAll("button[aria-label]")).find(b => /^send\b/i.test(b.getAttribute("aria-label") || "") && !b.disabled && shown(b));
+      if (!btn) await wait(100);
+    }
+    let via = "button";
+    if (btn) btn.click();
+    else { via = "enter"; ed.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true })); }
+    // confirmed only when a NEW user message with this text shows in the conversation
+    // the WHOLE prompt must be in the new message (markdown/whitespace ignored): two workers of the same project
+    // send prompts that differ only in their worktree line, so a prefix/suffix match is not enough
+    const canon = s => (s || "").toLowerCase().replace(/[\s*_`#>\[\]\\|~-]/g, "");
+    const want = canon(msg.text);
+    for (let i = 0; i < 60; i++) {
+      await wait(500);
+      const now = userEntries();
+      if (now.length <= nBefore) continue;
+      const fresh = now.filter(e => !beforeIds.has(e.getAttribute("data-message-id") || e.getAttribute("data-entry-id") || ""));
+      const hit = (fresh.length ? fresh : now.slice(-1)).reverse().find(e => canon(txt(e)).includes(want));
+      if (hit) return { status: "sent", reason: "new user message confirmed", via, msgId: hit.getAttribute("data-message-id") || "" };
+    }
+    return { status: "unconfirmed", reason: "sent, but no new user message seen in 30 s", via };
+  }
   chrome.runtime.onMessage.addListener((msg, _s, send) => {
     if (msg && msg.type === "rescan") { last = ""; tick(true); send({ ok: true }); return; }
-    if (msg && msg.type === "send_text") {
-      const ed = document.querySelector("textarea, [contenteditable=true], [role=textbox]");
-      if (!ed) { send({ ok: false, err: "no composer" }); return; }
-      ed.focus();
-      if (ed.tagName === "TEXTAREA") {
-        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
-        setter.call(ed, msg.text); ed.dispatchEvent(new Event("input", { bubbles: true }));
-      } else { document.execCommand("insertText", false, msg.text); }
-      setTimeout(() => {
-        const btn = Array.from(document.querySelectorAll("button")).find(b => /send/i.test(b.getAttribute("aria-label") || ""));
-        if (btn) btn.click(); else ed.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
-        send({ ok: true, via: btn ? "button" : "enter", tag: ed.tagName });
-      }, 400);
-      return true;
-    }
+    if (msg && msg.type === "hbm_send") { hbmSend(msg).then(send).catch(e => send({ status: "unconfirmed", reason: "error: " + e })); return true; }
     if (msg && msg.type === "dump") {
       const ids = {}; document.querySelectorAll("[data-testid]").forEach(e => { const k = e.getAttribute("data-testid"); ids[k] = (ids[k] || 0) + 1; });
       const ml = document.querySelector("[data-testid=message-list]");

@@ -34,6 +34,8 @@ def main():
 
     ensure_extension()
     ctl = Controller()
+    from .ui import style
+    style.apply_theme(ctl.settings["theme"] or "light")     # the saved theme, before any window is built
     win = MainWindow(ctl)
     def on_conn():
         c = server.nextPendingConnection()
@@ -53,5 +55,6 @@ def main():
         win.hide()
     else:
         win.show()
-    log("started")
+    from .version import version_text
+    log(f"started {version_text()} from {sys.argv[0]}")
     return app.exec()

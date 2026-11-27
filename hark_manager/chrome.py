@@ -54,12 +54,12 @@ class Profile:
         return self.alias or self.chrome_name or self.directory
 
 
-# ---------------- managed profiles (own --user-data-dir, any Chromium browser such as Cent Browser) ----------------
+# ---------------- managed profiles (own --user-data-dir, Cent Browser only) ----------------
 @__import__("functools").lru_cache(maxsize=64)
 def browser_name(exe):
     """Product name of a browser exe (e.g. 'Cent Browser'), from its version info; falls back to the file name."""
     if not exe:
-        return "Google Chrome"
+        return ""
     try:
         import win32api
         lang, cp = win32api.GetFileVersionInfo(exe, "\\VarFileInfo\\Translation")[0]
@@ -98,14 +98,20 @@ def managed_email(data_dir):
         return ""
 
 
+def is_cent_process_exe(pexe):
+    """A process exe (full path) is the configured Cent chrome.exe. Any other chrome.exe (personal Google Chrome)
+    never counts."""
+    return bool(CENT_EXE) and norm_path(pexe) == CENT_EXE
+
+
 def _profile_running(data_dir):
-    """True while any browser process runs with this --user-data-dir (it would overwrite the name on exit)."""
+    """True while the configured Cent exe runs with this --user-data-dir (it would overwrite the name on exit)."""
     want = norm_dir(data_dir)
     try:
         import psutil
-        for pr in psutil.process_iter(["name", "cmdline"]):
+        for pr in psutil.process_iter(["name", "cmdline", "exe"]):
             try:
-                if (pr.info["name"] or "").lower() != "chrome.exe":
+                if (pr.info["name"] or "").lower() != "chrome.exe" or not is_cent_process_exe(pr.info.get("exe") or ""):
                     continue
                 for a in pr.info["cmdline"] or []:
                     if a.startswith("--user-data-dir=") and norm_dir(a.split("=", 1)[1].strip('"')) == want:
@@ -173,6 +179,11 @@ def norm_dir(d):
 
 
 def launch_managed(p, exe, url=None, new_window=False, ext_dir=None, extra=None, minimized=False):
+    if not exe or not is_cent_exe(exe) or (CENT_EXE and norm_path(exe) != CENT_EXE):
+        log(f"launch {p.tag}: refused, not the configured Cent Browser exe ({exe})")
+        raise RuntimeError("Cent Browser exe set nahi / ghalat (Settings dekhein)")
+    if not p.data_dir:
+        raise RuntimeError("profile data folder missing")
     os.makedirs(p.data_dir, exist_ok=True)
     args = [exe, f"--user-data-dir={p.data_dir}", "--no-first-run", "--no-default-browser-check"] + list(extra or [])
     # docked windows sit inside the Manager, often out of sight: keep them rendering and their chats live
@@ -305,7 +316,7 @@ def focus_hwnd(hwnd):
 
 
 def focus_profile(profile, prefer_title=None):
-    wins = windows_for(profile)
+    wins = [w for w in windows_for(profile) if window_profile_ok(w[0], profile.data_dir)]
     if not wins:
         return False
     target = wins[0]
@@ -382,6 +393,28 @@ user32.SetParent.restype = wintypes.HWND
 user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
 user32.GetParent.restype = wintypes.HWND
 user32.GetParent.argtypes = [wintypes.HWND]
+user32.SetFocus.restype = wintypes.HWND
+user32.SetFocus.argtypes = [wintypes.HWND]
+user32.GetFocus.restype = wintypes.HWND
+user32.GetAncestor.restype = wintypes.HWND
+user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.SetActiveWindow.restype = wintypes.HWND
+user32.SetActiveWindow.argtypes = [wintypes.HWND]
+user32.GetWindow.restype = wintypes.HWND
+user32.GetWindow.argtypes = [wintypes.HWND, ctypes.c_uint]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+
+
+class _GUITHREADINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD), ("hwndActive", wintypes.HWND),
+                ("hwndFocus", wintypes.HWND), ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND), ("rcCaret", wintypes.RECT)]
+
+
+user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(_GUITHREADINFO)]
 
 
 # ---------- taskbar buttons (ITaskbarList, plain COM through ctypes) ----------
@@ -542,10 +575,12 @@ def _proc_has_bridge_flag(p):
     try:
         import psutil
         want = norm_dir(p.data_dir)
-        for pr in psutil.process_iter(["name", "cmdline"]):
+        for pr in psutil.process_iter(["name", "cmdline", "exe"]):
             cl = pr.info.get("cmdline") or []
             if not cl or any(a.startswith("--type=") for a in cl):
                 continue
+            if not is_cent_process_exe(pr.info.get("exe") or ""):
+                continue                 # personal Chrome / any other browser is never looked at
             if want and not any(a.startswith("--user-data-dir=") and norm_dir(a.split("=", 1)[1].strip('"')) == want for a in cl):
                 continue
             if not want:
@@ -569,9 +604,224 @@ def bridge_installed(p, running):
     return os.path.isfile(os.path.join(p.data_dir, "_hbm_bridge", "manifest.json"))
 
 
-def reparent(hwnd, parent):
-    """Move an already hosted browser window from one of our host widgets to another (no style change)."""
+def embedded_child_at(parent, x, y):
+    """The docked Cent window (a direct child of one of our host widgets) that contains screen point x, y."""
+    import win32gui
+    GW_CHILD, GW_HWNDNEXT = 5, 2
+    c = user32.GetWindow(parent, GW_CHILD)
+    while c:
+        try:
+            if user32.IsWindowVisible(c) and win32gui.GetClassName(c) == "Chrome_WidgetWin_1":
+                l, t, r, b = win32gui.GetWindowRect(c)
+                if l <= x < r and t <= y < b:
+                    return int(c)
+        except Exception:
+            pass
+        c = user32.GetWindow(c, GW_HWNDNEXT)
+    return None
+
+
+def embedded_window_from_point(x, y, root):
+    """The docked Cent window (child of one of our hosts, inside top-level root) under screen point x, y."""
+    import win32gui
+    w = user32.WindowFromPoint(wintypes.POINT(x, y))
+    while w:
+        par = user32.GetParent(w)
+        try:
+            if par and win32gui.GetClassName(w) == "Chrome_WidgetWin_1" and win32gui.GetClassName(par) != "Chrome_WidgetWin_1" \
+                    and user32.GetAncestor(w, 2) == root:
+                return int(w)
+        except Exception:
+            return None
+        w = par
+    return None
+
+
+def _thread_focus(tid):
+    gi = _GUITHREADINFO()
+    gi.cbSize = ctypes.sizeof(_GUITHREADINFO)
+    if not user32.GetGUIThreadInfo(tid, ctypes.byref(gi)):
+        return None
+    return int(gi.hwndFocus or 0)
+
+
+def is_activatable(hwnd):
+    """A docked window that can be the active window (hosted without WS_CHILD, see set_activatable)."""
+    st = user32.GetWindowLongPtrW(hwnd, GWL_STYLE) & 0xFFFFFFFF
+    return bool(st) and not (st & WS_CHILD)
+
+
+def set_activatable(hwnd, on):
+    """Address / search bar in a Live Multi-View pane. A WS_CHILD window can never be the active window, and
+    Chrome's own UI (omnibox focus on a click, Ctrl+L / Alt+D / F6, typing and Ctrl+V into the omnibox) only works
+    while GetActiveWindow() is the browser window itself: clicking the bar or pressing Ctrl+L did nothing (only
+    typing into the page worked). on=True keeps the window parented to its pane (it moves, scrolls and is clipped
+    with the pane, no taskbar button) but drops WS_CHILD, so a click in it activates THAT browser window like a
+    normal window and every other pane, and the Manager, become inactive. on=False: a plain child window again."""
     import win32gui
     import win32con
+    if not is_window(hwnd):
+        return False
+    st = user32.GetWindowLongPtrW(hwnd, GWL_STYLE) & 0xFFFFFFFF
+    new = ((st & ~WS_CHILD) | WS_POPUP) if on else ((st & ~WS_POPUP) | WS_CHILD)
+    if new != st:
+        user32.SetWindowLongPtrW(hwnd, GWL_STYLE, new)
+        win32gui.SetWindowPos(hwnd, 0, 0, 0, 0, 0, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOZORDER
+                              | win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED)
+    return True
+
+
+def foreground():
+    return int(user32.GetForegroundWindow() or 0)
+
+
+def press_ctrl(key):
+    """Ctrl+<key> to whatever window has the keyboard now (SendInput through keybd_event)."""
+    VK_CONTROL, KEYUP = 0x11, 0x0002
+    vk = ord(key.upper())
+    ke = ctypes.windll.user32.keybd_event
+    ke(VK_CONTROL, 0, 0, 0)
+    ke(vk, 0, 0, 0)
+    ke(vk, 0, KEYUP, 0)
+    ke(VK_CONTROL, 0, KEYUP, 0)
+
+
+def focus_embedded(hwnd):
+    """Give the keyboard focus to a docked Cent window. A docked window is a WS_CHILD of our (Qt) window in
+    another process: a click in it never moves the Win32 focus there (Chrome does not SetFocus itself, it waits
+    for WM_ACTIVATE, which child windows never get), so the keys kept going to the Qt top-level. Only done while
+    our window is the foreground window. True when the Cent window (or one of its children) has the focus."""
+    if not is_window(hwnd):
+        return False
+    root = user32.GetAncestor(hwnd, 2)            # GA_ROOT: our window that hosts it
+    fg = user32.GetForegroundWindow()
+    # ours in the foreground: the hosting window itself, or one of its activatable docked browser windows
+    if not root or not fg or (fg != root and user32.GetAncestor(fg, 2) != root):
+        return False
+    tid = user32.GetWindowThreadProcessId(hwnd, None)
+    if is_activatable(hwnd):
+        # a Multi-View pane: make THIS browser window the active one (its omnibox, Ctrl+L and typing then work)
+        if fg == hwnd:
+            return True
+        user32.SetActiveWindow(hwnd)
+        if user32.GetForegroundWindow() != hwnd:
+            me = ctypes.windll.kernel32.GetCurrentThreadId()
+            try:
+                if user32.AttachThreadInput(me, tid, True):
+                    user32.SetActiveWindow(hwnd)
+                    user32.AttachThreadInput(me, tid, False)
+            except Exception as e:
+                log(f"focus_embedded {hwnd}: {e}")
+        ok = user32.GetForegroundWindow() == hwnd
+        if not ok:
+            log(f"focus_embedded {hwnd}: the pane's browser window did not become active")
+        return ok
+
+    def has_focus():
+        f = _thread_focus(tid)
+        return bool(f) and (f == hwnd or bool(user32.IsChild(hwnd, f)))
+
+    if has_focus():
+        return True
+    user32.SetFocus(hwnd)          # works directly: SetParent attached our input queue to the browser's thread
+    if has_focus():
+        return True
+    me = ctypes.windll.kernel32.GetCurrentThreadId()
+    try:
+        if user32.AttachThreadInput(me, tid, True):
+            user32.SetFocus(hwnd)
+            user32.AttachThreadInput(me, tid, False)
+    except Exception as e:
+        log(f"focus_embedded {hwnd}: {e}")
+    ok = has_focus()
+    if not ok:
+        log(f"focus_embedded {hwnd}: the browser window did not take the keyboard focus")
+    return ok
+
+
+_clipped = {}     # popup hwnd -> rect (window coords) it is clipped to, or () for fully hidden
+
+
+def owned_popups(owners):
+    """{owner hwnd: [visible top-level popup hwnds it owns]} for docked Cent windows: Chrome's own bubbles
+    ('Restore pages?', permission prompts, menus) are separate top-level windows owned by the docked window."""
+    import win32gui
+    owners = set(int(h) for h in owners if h)
+    out = {h: [] for h in owners}
+    if not owners:
+        return out
+
+    def cb(w, _):
+        try:
+            o = int(user32.GetWindow(w, 4) or 0)          # GW_OWNER
+            if o in owners and user32.IsWindowVisible(w):
+                out[o].append(int(w))
+        except Exception:
+            pass
+        return True
+    try:
+        win32gui.EnumWindows(cb, None)
+    except Exception:
+        pass
+    return out
+
+
+def notify_moved(hwnd):
+    """A docked window moved on screen together with its host (e.g. the grid scrolled): its position relative to
+    the host did not change, so the browser was not told. WM_MOVE makes it re-anchor its bubbles to where it is."""
+    try:
+        user32.PostMessageW(hwnd, 0x0003, 0, 0)
+    except Exception:
+        pass
+
+
+def clip_popups(popups, vis):
+    """Clip the docked window's popups to vis (screen rect l, t, r, b of the pane area that is on screen; None when
+    none is), so no bubble floats over the Manager's header bar, the Grid scrollbar or another pane."""
+    import win32gui
+    for w in popups:
+        try:
+            l, t, r, b = win32gui.GetWindowRect(w)
+        except Exception:
+            continue
+        if vis and l >= vis[0] and t >= vis[1] and r <= vis[2] and b <= vis[3]:
+            if w in _clipped:
+                user32.SetWindowRgn(w, None, True)
+                _clipped.pop(w, None)
+            continue
+        if vis:
+            cl, ct, cr, cb_ = max(l, vis[0]) - l, max(t, vis[1]) - t, min(r, vis[2]) - l, min(b, vis[3]) - t
+            rect = (cl, ct, cr, cb_) if cr > cl and cb_ > ct else ()
+        else:
+            rect = ()
+        if _clipped.get(w) == rect:
+            continue
+        gdi = ctypes.windll.gdi32
+        gdi.CreateRectRgn.restype = ctypes.c_void_p
+        rgn = gdi.CreateRectRgn(*(rect or (0, 0, 0, 0)))
+        if rgn and user32.SetWindowRgn(w, ctypes.c_void_p(rgn), True):
+            _clipped[w] = rect          # the system owns the region now
+        elif rgn:
+            gdi.DeleteObject(ctypes.c_void_p(rgn))
+
+
+def unclip_popups(popups=None):
+    """Give popups their whole area back (the window left the grid). None: every popup clipped so far."""
+    for w in list(_clipped) if popups is None else popups:
+        if w in _clipped:
+            try:
+                if is_window(w):
+                    user32.SetWindowRgn(w, None, True)
+            except Exception:
+                pass
+            _clipped.pop(w, None)
+
+
+def reparent(hwnd, parent):
+    """Move an already hosted browser window from one of our host widgets to another. It always arrives as a plain
+    child window (WS_CHILD); a Live Multi-View pane makes its own window activatable again (set_activatable)."""
+    import win32gui
+    import win32con
+    set_activatable(hwnd, False)
     user32.SetParent(hwnd, parent)
     win32gui.SetWindowPos(hwnd, 0, 0, 0, 0, 0, win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_SHOWWINDOW)

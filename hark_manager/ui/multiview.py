@@ -11,10 +11,11 @@ import math
 import time
 
 from PySide6.QtCore import Qt, QTimer, QSettings, QPoint, QRect
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QComboBox, QSlider, QSplitter,
-                               QScrollArea, QApplication)
+                               QScrollArea, QScrollBar, QPushButton, QApplication)
 
-from .browser_view import Host
+from .browser_view import Host, EmbedFocus
 from .widgets import label, button, Dot, VpnBadge
 from .style import build_qss, GREEN, LIME
 from . import icons
@@ -53,6 +54,8 @@ class PaneHeader(QFrame):
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             self._press = e.globalPosition().toPoint()
+            if self.pane.hwnd:
+                self.pane.mv.kb_hwnd = self.pane.hwnd       # this pane is the one Ctrl+L (from the grid) goes to
             e.accept()
 
     def mouseMoveEvent(self, e):
@@ -71,6 +74,109 @@ class PaneHeader(QFrame):
             self.pane.mv.drag_drop(self.pane, g if moved else None)
 
 
+class GridScroll(QScrollArea):
+    """The grid's scroll area. The mouse wheel over a pane header, a splitter gap or a pane message scrolls the
+    whole grid (those events bubble up here). The wheel inside a docked browser is never seen here: Windows
+    delivers it to the browser window under the cursor (its own process) and the pane's Host swallows anything
+    the browser would hand back, so a chat scrolls only itself."""
+    WHEEL_PX = 110                    # pixels per wheel notch (120 units)
+
+    def wheelEvent(self, e):
+        d = e.angleDelta()
+        horiz = bool(e.modifiers() & Qt.ShiftModifier) or (d.x() and not d.y())
+        bar = self.horizontalScrollBar() if horiz else self.verticalScrollBar()
+        delta = (d.y() or d.x())
+        if not delta and not e.pixelDelta().isNull():
+            delta = e.pixelDelta().y() or e.pixelDelta().x()
+            bar.setValue(bar.value() - delta)
+        else:
+            bar.setValue(bar.value() - int(delta * self.WHEEL_PX / 120))
+        e.accept()
+
+
+class GridBar(QFrame):
+    """Always visible "Grid" scrollbar on the right edge, outside the panes (▲ / thumb / ▼). It mirrors the grid
+    scroll area's own vertical bar (kept hidden): dragging it, ▲ / ▼ (one grid row at a time) and the wheel over
+    headers / gaps all move the same value."""
+
+    def __init__(self, mv, inner):
+        super().__init__()
+        self.mv, self.inner = mv, inner
+        self.setObjectName("gridCol")
+        self.setFixedWidth(58)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(7, 8, 7, 8)
+        v.setSpacing(8)
+        cap = QLabel("Grid")
+        cap.setObjectName("gridCap")
+        cap.setAlignment(Qt.AlignCenter)
+        cap.setFixedHeight(32)
+        cap.setAccessibleName("Grid scroll")
+        v.addWidget(cap)
+        self.up = QPushButton("▲")
+        self.up.setObjectName("gridBtn")
+        self.up.setFixedSize(44, 40)
+        self.up.setAutoRepeat(True)
+        self.up.setAutoRepeatDelay(450)
+        self.up.setAutoRepeatInterval(220)
+        self.up.setToolTip("Grid upar scroll (ek row)")
+        self.up.setAccessibleName("Grid scroll up")
+        self.up.clicked.connect(lambda: self.step(-1))
+        v.addWidget(self.up, 0, Qt.AlignHCenter)
+        self.bar = QScrollBar(Qt.Vertical)
+        self.bar.setObjectName("gridBar")
+        self.bar.setAccessibleName("Grid scrollbar")
+        self.bar.setToolTip("Poori grid scroll karein")
+        v.addWidget(self.bar, 1, Qt.AlignHCenter)
+        self.down = QPushButton("▼")
+        self.down.setObjectName("gridBtn")
+        self.down.setFixedSize(44, 40)
+        self.down.setAutoRepeat(True)
+        self.down.setAutoRepeatDelay(450)
+        self.down.setAutoRepeatInterval(220)
+        self.down.setToolTip("Grid neeche scroll (ek row)")
+        self.down.setAccessibleName("Grid scroll down")
+        self.down.clicked.connect(lambda: self.step(1))
+        v.addWidget(self.down, 0, Qt.AlignHCenter)
+        for w in (self.up, self.down, self.bar):
+            w.setFocusPolicy(Qt.NoFocus)        # keys typed for a pane never land on the Grid controls
+        inner.rangeChanged.connect(self.sync_range)
+        inner.valueChanged.connect(self._from_inner)
+        self.bar.valueChanged.connect(self._from_bar)
+        self.sync_range(inner.minimum(), inner.maximum())
+
+    def sync_range(self, lo, hi):
+        self.bar.setRange(lo, hi)
+        self.bar.setPageStep(max(1, self.mv.scroll.viewport().height()))
+        self.bar.setSingleStep(60)
+        self.bar.setValue(self.inner.value())
+        self.bar.setEnabled(hi > lo)
+        self.up.setEnabled(hi > lo)
+        self.down.setEnabled(hi > lo)
+
+    def _from_inner(self, val):
+        if self.bar.value() != val:
+            self.bar.setValue(val)
+
+    def _from_bar(self, val):
+        if self.inner.value() != val:
+            self.inner.setValue(val)
+
+    def wheelEvent(self, e):
+        self.mv.scroll.wheelEvent(e)
+
+    def step(self, direction):
+        """One grid row up / down: the next row starts at the top of the view (the last stop is the bottom)."""
+        cur, hi = self.inner.value(), self.inner.maximum()
+        tops = sorted({r.mapTo(self.mv.canvas, QPoint(0, 0)).y() for r in self.mv.rows if r.isVisible()})
+        if direction > 0:
+            nxt = [t for t in tops if t > cur + 2]
+            self.inner.setValue(min(hi, nxt[0]) if nxt else hi)
+        else:
+            prv = [t for t in tops if t < cur - 2]
+            self.inner.setValue(prv[-1] if prv else 0)
+
+
 class Pane(QFrame):
     def __init__(self, mv, directory):
         super().__init__()
@@ -78,6 +184,8 @@ class Pane(QFrame):
         self.hwnd = None
         self.hark_tries, self.hark_next = 0, 0
         self.deadline = time.time() + 25
+        self.gone = False         # its browser was closed and the profile has no other window: the grid drops it
+        self.lost_at = 0          # when its window closed (a short grace to pick up another window of the profile)
         self.setObjectName("pane")
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -110,6 +218,7 @@ class Pane(QFrame):
 
     def set_expanded(self, on):
         self.b_exp.setIcon(icons.icon("collapse" if on else "expand", 20))
+        self.b_exp.setProperty("hbm_icon", f"{'collapse' if on else 'expand'}:20")
         self.b_exp.setToolTip("Collapse" if on else "Expand")
         self.b_exp.setAccessibleName(f"{'Collapse' if on else 'Expand'} {self.name.text()}")
 
@@ -157,6 +266,8 @@ class Pane(QFrame):
             self.failed = hwnd
             return
         self.hwnd = hwnd
+        # activatable inside the pane: a click in its address bar / Ctrl+L / typing reach THIS browser (set_activatable)
+        chrome.set_activatable(hwnd, True)
         self.fit()
         self.hark_tries, self.hark_next = 0, 0
         self.ask_hark()
@@ -164,9 +275,21 @@ class Pane(QFrame):
     def ask_hark(self):
         """Bring this window's Hark chat tab to the front (the bridge opens hark.com/chat only when it has none).
         Retried a few times: a bridge picks commands up on its next report (<= 30 s) or may be reloading."""
-        if not self.hwnd or "hark" in chrome.window_title(self.hwnd).lower() or self.hark_tries >= 4:
-            return
         p = self.mv.ctl.profile(self.dir)
+        if p and self.mv.ctl.is_planner(p):
+            # the Shared Repo Team's Planner works in ChatGPT: never switch its tab to Hark
+            if self.hark_tries < 99:
+                log(f"multiview {self.dir}: team Planner, its tab is left as it is (no show_hark)")
+            self.hark_tries = 99
+            return
+        if not self.hwnd or self.hark_tries >= 4:
+            return
+        if "hark" in chrome.window_title(self.hwnd).lower() or self.mv.kb_hwnd == self.hwnd \
+                or chrome.foreground() == self.hwnd:
+            # its Hark tab is in front, or the user works in this pane: done. A tab the user opens or picks later
+            # (Ctrl+T, a URL typed in the address bar) is never switched back to Hark behind their back.
+            self.hark_tries = 99
+            return
         if p and self.hark_tries >= 2 and not getattr(self, "hark_opened", False):
             # an older bridge copy has no show_hark: open hark.com/chat; the browser puts it in this (hosted) window
             self.hark_opened = True
@@ -180,7 +303,11 @@ class Pane(QFrame):
             with self.mv.ctl.bridge.lock:
                 q = self.mv.ctl.bridge.commands.get(key) or []
                 self.mv.ctl.bridge.commands[key] = [c for c in q if c.get("type") != "show_hark"]
-            self.mv.ctl.bridge.queue_command(key, {"type": "show_hark"})
+            cmd = {"type": "show_hark"}
+            wurl = self.mv.ctl.team_worker_url(p)
+            if wurl:
+                cmd["url"] = wurl         # a team worker: its own project tab, never another Hark tab
+            self.mv.ctl.bridge.queue_command(key, cmd)
             self.hark_tries += 1
             self.hark_next = time.time() + 35
 
@@ -189,10 +316,13 @@ class Pane(QFrame):
             if not chrome.is_window(self.hwnd):
                 self.mv.dock.forget(self.hwnd)
                 self.hwnd = None
+                self.lost_at = time.time()
                 self.host.hide()
-                self.msg.setText("Browser window band ho gayi. Refresh dabayein.")
+                self.msg.setText("Browser window band ho gayi\u2026")
                 self.msg.show()
                 return
+            if not chrome.is_activatable(self.hwnd):
+                chrome.set_activatable(self.hwnd, True)
             self.keep_in_place()
             if time.time() > getattr(self, "hark_next", 0):
                 self.ask_hark()
@@ -208,7 +338,13 @@ class Pane(QFrame):
                 and w[0] != getattr(self, "failed", None)]
         if wins:
             hark = [w for w in wins if "hark" in (w[1] or "").lower()]
+            self.lost_at = 0
             return self.take((hark or wins)[0][0])
+        # closed by the user (or never came up): no window of this profile left -> the pane goes
+        if (self.lost_at and time.time() - self.lost_at > 0.6) or time.time() > self.deadline:
+            if not any(chrome.is_window(w[0]) for w in chrome.windows_for(p)):
+                self.gone = True
+                return
         if time.time() > self.deadline:
             self.msg.setText("Window nahi mili. Profile launch karke Refresh dabayein.")
         else:
@@ -228,6 +364,24 @@ class Pane(QFrame):
                 self.fit()
         except Exception:
             pass
+
+    def visible_rect(self):
+        """Screen rect (device pixels) of this pane's browser area that is on screen: host ∩ grid viewport."""
+        import win32gui
+        try:
+            if not self.host.isVisible():
+                return None
+            l, t, r, b = win32gui.GetWindowRect(int(self.host.winId()))
+            vp = int(self.mv.scroll.viewport().winId())
+            vl, vt = win32gui.ClientToScreen(vp, (0, 0))
+            _, _, vw, vh = win32gui.GetClientRect(vp)
+            l, t, r, b = max(l, vl), max(t, vt), min(r, vl + vw), min(b, vt + vh)
+            return (l, t, r, b) if r > l and b > t else None
+        except Exception:
+            return None
+
+    def clip_popups(self, popups):
+        chrome.clip_popups(popups, self.visible_rect())
 
 
 class MultiView(QWidget):
@@ -251,6 +405,17 @@ class MultiView(QWidget):
             QSlider::groove:horizontal{height:6px;background:#E3E6EA;border-radius:3px;}
             QSlider::sub-page:horizontal{background:#9BEA2C;border-radius:3px;}
             QSlider::handle:horizontal{background:white;border:2px solid #7BD21A;width:16px;margin:-7px 0;border-radius:10px;}
+            QFrame#gridCol{background:#FFFFFF;border-left:1px solid #E3E6EA;}
+            QLabel#gridCap{background:#2A303B;color:white;font-size:15px;font-weight:700;border-radius:7px;}
+            QPushButton#gridBtn{background:#FFFFFF;border:1px solid #CDD1D6;border-radius:9px;font-size:15px;color:#111418;padding:0;}
+            QPushButton#gridBtn:hover{background:#EAF8D2;border-color:#7BD21A;}
+            QPushButton#gridBtn:disabled{color:#B8BDC4;}
+            QScrollBar#gridBar:vertical{width:16px;background:#E9ECEF;border-radius:8px;margin:0;}
+            QScrollBar#gridBar::handle:vertical{background:#9BEA2C;border-radius:8px;min-height:48px;}
+            QScrollBar#gridBar::handle:vertical:hover{background:#8FE01F;}
+            QScrollBar#gridBar::handle:vertical:disabled{background:#D5D9DE;}
+            QScrollBar#gridBar::add-line, QScrollBar#gridBar::sub-line{height:0;}
+            QScrollBar#gridBar::add-page, QScrollBar#gridBar::sub-page{background:transparent;}
         """)
         self.setObjectName("mvRoot")
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -310,8 +475,10 @@ class MultiView(QWidget):
         b.addWidget(self.b_close)
         v.addWidget(bar)
 
-        self.scroll = QScrollArea()
+        self.scroll = GridScroll()
         self.scroll.setWidgetResizable(False)
+        # the vertical bar is the "Grid" column on the right (GridBar); the area's own one stays hidden
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         # a native viewport clips the hosted browser windows to the visible area while scrolling
         self.scroll.viewport().setAttribute(Qt.WA_NativeWindow, True)
@@ -321,7 +488,16 @@ class MultiView(QWidget):
         self.cv = QVBoxLayout(self.canvas)
         self.cv.setContentsMargins(0, 0, 0, 0)
         self.scroll.setWidget(self.canvas)
-        v.addWidget(self.scroll, 1)
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(self.scroll, 1)
+        self.gridbar = GridBar(self, self.scroll.verticalScrollBar())
+        body.addWidget(self.gridbar)
+        v.addLayout(body, 1)
+        # docked browser windows follow the grid at once when it scrolls (their hosts are clipped by the viewport)
+        self.scroll.verticalScrollBar().valueChanged.connect(self.on_scrolled)
+        self.scroll.horizontalScrollBar().valueChanged.connect(self.on_scrolled)
         self.outer = None
 
         lay = self.qs.value("multiview/layout", DEFAULT_LAYOUT)
@@ -335,9 +511,22 @@ class MultiView(QWidget):
         self.t_status = QTimer(self, interval=3000, timeout=self.refresh_status)
         ctl.changed.connect(self.refresh_status)
         self._save_t = QTimer(self, singleShot=True, interval=400, timeout=self.save_splits)
+        self._clip_t = QTimer(self, singleShot=True, interval=150, timeout=self.clip_popups)
+        # keyboard focus: a click in a pane's browser gives that browser the keys (EmbedFocus); the pane that had
+        # them last gets them back when this window is activated again (Alt+Tab, taskbar) or after Expand/Collapse
+        self.kb_hwnd = None
+        EmbedFocus.install().listeners.append(self.on_embed_focus)
+        # Ctrl+L / Alt+D / F6 while the grid itself has the keys (a pane header, the top bar): the address bar of the
+        # pane worked in last (or whose header was clicked), never another pane's and never the Manager
+        for ks in ("Ctrl+L", "Alt+D", "F6"):
+            sc = QShortcut(QKeySequence(ks), self)
+            sc.setContext(Qt.WindowShortcut)
+            sc.activated.connect(self.focus_address_bar)
 
     # ---------- open / close ----------
     def open(self):
+        # activated again by Alt+Tab / the taskbar: the keys go back to the pane that had them (a click decides itself)
+        EmbedFocus.install().activated[int(self.winId())] = self.focus_pane
         if self.isVisible():
             self.showMaximized()
             self.raise_()
@@ -369,6 +558,28 @@ class MultiView(QWidget):
         self.qs.setValue("multiview/order", json.dumps(cur + rest))
         self.qs.sync()
 
+    # ---------- keyboard focus ----------
+    def on_embed_focus(self, hwnd, ok):
+        if any(p.hwnd == hwnd for p in self.panes):
+            self.kb_hwnd = hwnd
+
+    def focus_address_bar(self):
+        p = next((p for p in self.panes if p.hwnd and p.hwnd == self.kb_hwnd and p.isVisible()), None)
+        if not p:
+            p = next((p for p in self.panes if p.hwnd and p.isVisible()), None)
+        if p and self.focus_pane(p):
+            QTimer.singleShot(80, lambda: chrome.foreground() == p.hwnd and chrome.press_ctrl("L"))
+            log(f"multiview Ctrl+L -> address bar of {p.dir}")
+
+    def focus_pane(self, pane=None):
+        """Keys to this pane's browser (default: the one that had them last), if it is shown in the grid."""
+        h = pane.hwnd if pane else self.kb_hwnd
+        p = next((p for p in self.panes if p.hwnd and p.hwnd == h), None)
+        if p and p.isVisible() and chrome.focus_embedded(p.hwnd):
+            self.kb_hwnd = p.hwnd
+            return True
+        return False
+
     def closeEvent(self, e):
         self.release_all()
         self.tick.stop()
@@ -377,6 +588,7 @@ class MultiView(QWidget):
 
     def release_all(self):
         self.save_splits()
+        chrome.unclip_popups()          # bubbles of windows leaving the grid get their whole area back
         for pane in self.panes:
             if pane.hwnd:
                 self.dock.give_back(pane.hwnd)
@@ -472,6 +684,20 @@ class MultiView(QWidget):
         super().resizeEvent(e)
         QTimer.singleShot(0, self.size_canvas)
 
+    def on_scrolled(self, *_):
+        for p in self.panes:
+            if p.hwnd:
+                p.keep_in_place()
+                chrome.notify_moved(p.hwnd)     # its own bubbles re-anchor to where it is now
+        self._clip_t.start()
+
+    def clip_popups(self):
+        """Chrome's bubbles of the docked windows are top-level windows: keep each inside its pane's visible area."""
+        live = [p for p in self.panes if p.hwnd]
+        pops = chrome.owned_popups([p.hwnd for p in live])
+        for p in live:
+            p.clip_popups(pops.get(p.hwnd, []))
+
     # ---------- splitter sizes ----------
     def _split_key(self):
         return f"multiview/splits/{self.layout_box.currentText()}/{len(self.panes)}"
@@ -493,6 +719,8 @@ class MultiView(QWidget):
             data = None
         def apply(s, fr):
             n = s.count()
+            if not n:
+                return          # empty grid (last window closed): nothing to size
             if not fr or len(fr) != n:
                 fr = [1 / n] * n
             tot = (s.height() if s.orientation() == Qt.Vertical else s.width()) or 1000
@@ -561,6 +789,8 @@ class MultiView(QWidget):
         if self.expanded is None:
             self.restore_splits()
         QTimer.singleShot(50, lambda: [p.fit() for p in self.panes])
+        # the keys go to the pane just expanded / collapsed (its browser was hidden or moved meanwhile)
+        QTimer.singleShot(120, lambda: self.focus_pane(pane) if pane in self.panes else None)
 
     def pane_at(self, g):
         for p in self.panes:
@@ -605,15 +835,32 @@ class MultiView(QWidget):
     def poll(self):
         for p in self.panes:
             p.poll()
+        if self.drop_closed():
+            return
+        fg = chrome.foreground()
+        if fg and any(p.hwnd == fg for p in self.panes):
+            self.kb_hwnd = fg            # the pane the user is working in (activated by a click in it)
+        self.clip_popups()
         if time.time() - getattr(self, "_auto_t", 0) > 2:
             self._auto_t = time.time()
             self.auto_add()
+
+    def drop_closed(self):
+        """Panes whose Cent window was closed go at once; the rest re-tile, and the counts update."""
+        gone = [p.dir for p in self.panes if p.gone]
+        if not gone:
+            return False
+        left = [p.dir for p in self.panes if not p.gone]
+        log(f"multiview: closed window(s) dropped {gone}, {len(left)} pane(s) left")
+        self.build(left)                       # grid re-arranged for the new count + title "(N Open Profiles)"
+        self.ctl.refresh_windows()             # main window Open Profiles count / cards follow
+        return True
 
     def auto_add(self):
         """A Cent profile launched (or a docked one) while the grid is open gets its own pane automatically."""
         cur = [p.dir for p in self.panes]
         new = [p.directory for p in self.ctl.profiles if p.directory not in cur and p.directory not in self.ctl.no_dock
-               and (any(not self.dock.has(w[0]) and w[0] not in self.dock.released for w in self.ctl.windows.get(p.directory) or [])
+               and (any(not self.dock.has(w[0]) and w[0] not in self.dock.released and chrome.is_window(w[0]) for w in self.ctl.windows.get(p.directory) or [])
                     or self.dock.window_of(p.directory, "park"))]
         if new:
             log(f"multiview auto-add: {new}")

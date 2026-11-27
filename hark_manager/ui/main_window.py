@@ -8,6 +8,7 @@ from .widgets import card, label, button, IconLabel, Dot
 from .style import build_qss, ORANGE, GREEN, GRAY
 from .. import config
 from ..config import APP_TITLE
+from ..version import version_text
 
 
 class NavButton(QPushButton):
@@ -16,6 +17,7 @@ class NavButton(QPushButton):
         self.setObjectName("nav")
         self.setCheckable(True)
         self.setIcon(icons.icon(ic, 24))
+        self.setProperty("hbm_icon", f"{ic}:24")
         self.setIconSize(QSize(24, 24))
         self.setMinimumHeight(52)
         self.setCursor(Qt.PointingHandCursor)
@@ -83,6 +85,12 @@ class NeedsReplyPanel(QWidget):
             q = label(a["question"], size=16, wrap=True)
             q.setToolTip(a["conv_title"])
             col.addWidget(q)
+            p = self.ctl.profile(a["profile_dir"])
+            if p and self.ctl.status(p) == "Unknown":
+                # the last Refresh got no fresh answer from this profile: the question may be answered by now
+                u = label("Status: Unknown (last Refresh: no fresh answer)", obj="muted", wrap=True)
+                u.setAccessibleName(f"Needs reply status {a['profile_name']}: Unknown")
+                col.addWidget(u)
             b = button("Open task", "outline")
             b.setMinimumHeight(42)
             b.setStyleSheet("font-size:17px")
@@ -103,7 +111,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.ctl = ctl
         self.quitting = False
-        self.setWindowTitle(APP_TITLE)
+        self.version = version_text()          # e.g. v1.0.4 (0ce8437): which code is running
+        self.setWindowTitle(f"{APP_TITLE}  {self.version}")
         self.setWindowIcon(icons.icon("logo", 32))
         self.resize(1680, 980)
         self.setMinimumSize(1180, 720)
@@ -130,6 +139,10 @@ class MainWindow(QMainWindow):
         self.badge.setObjectName("badge")
         self.badge.move(160, 15)
         sv.addStretch(1)
+        self.ver_lbl = label(self.version, obj="muted")
+        self.ver_lbl.setAccessibleName("App version")
+        self.ver_lbl.setToolTip("App version aur commit (GitHub par yahi SHA hona chahiye)")
+        sv.addWidget(self.ver_lbl)
         h.addWidget(side)
 
         self.stack = QStackedWidget()
@@ -142,7 +155,7 @@ class MainWindow(QMainWindow):
         for p in (self.profiles, self.alerts, self.settings, self.view):
             self.stack.addWidget(p)
         h.addWidget(self.stack, 1)
-        self.right = NeedsReplyPanel(ctl)
+        self.right = self._build_right(ctl)
         h.addWidget(self.right)
 
         self.mv = None
@@ -180,6 +193,54 @@ class MainWindow(QMainWindow):
         self.go(int(s["last_view"]) if s["restore_last_view"] else 0)
         if not ctl.bridge_ok:
             QTimer.singleShot(800, lambda: QMessageBox.warning(self, APP_TITLE, f"Bridge port {config.BRIDGE_PORT} busy hai: {ctl.bridge.error}\nKya app pehle se chal rahi hai?"))
+
+    def _build_right(self, ctl):
+        """Right panel: Needs reply, and the Team Plan & Safe Dispatch drawer (switch with the two tabs on top)."""
+        from .team_dispatch import TeamDispatchPanel
+        box = QWidget()
+        box.setObjectName("rightPanel")
+        box.setAttribute(Qt.WA_StyledBackground, True)
+        box.setFixedWidth(390)
+        v = QVBoxLayout(box)
+        v.setContentsMargins(10, 10, 10, 0)
+        v.setSpacing(0)
+        tabs = QHBoxLayout()
+        tabs.setSpacing(0)
+        self.rt_needs = QPushButton("Needs reply")
+        self.rt_team = QPushButton("Team Dispatch")
+        for b, rad in ((self.rt_needs, "border-top-left-radius:9px;border-bottom-left-radius:9px;"),
+                       (self.rt_team, "border-top-right-radius:9px;border-bottom-right-radius:9px;")):
+            b.setObjectName("seg")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setMinimumHeight(36)
+            b.setStyleSheet("font-size:15px;" + rad)
+            tabs.addWidget(b, 1)
+        self.rt_needs.setAccessibleName("Needs reply tab")
+        self.rt_team.setAccessibleName("Team Dispatch tab")
+        v.addLayout(tabs)
+        self.right_stack = QStackedWidget()
+        self.needs = NeedsReplyPanel(ctl)
+        self.needs.setMinimumWidth(0)
+        self.needs.setMaximumWidth(16777215)
+        self.team = TeamDispatchPanel(ctl)
+        self.right_stack.addWidget(self.needs)
+        self.right_stack.addWidget(self.team)
+        v.addWidget(self.right_stack, 1)
+
+        def show(i):
+            self.right_stack.setCurrentIndex(i)
+            self.rt_needs.setChecked(i == 0)
+            self.rt_team.setChecked(i == 1)
+            ctl.settings["right_drawer"] = i
+            ctl.settings.save()
+        self.rt_needs.clicked.connect(lambda: show(0))
+        self.rt_team.clicked.connect(lambda: show(1))
+        i = int(ctl.settings.get("right_drawer", 0) or 0)
+        self.right_stack.setCurrentIndex(i)
+        self.rt_needs.setChecked(i == 0)
+        self.rt_team.setChecked(i == 1)
+        return box
 
     def go(self, i):
         if self.stack.currentIndex() == 3 and i != 3:

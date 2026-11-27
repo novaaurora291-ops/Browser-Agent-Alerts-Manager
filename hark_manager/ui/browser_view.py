@@ -6,13 +6,84 @@ Back to profiles only shows the dashboard: the window stays docked (hidden) insi
 running, with no desktop window and no taskbar button."""
 import time
 
-from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame
+from ctypes import wintypes
+
+from PySide6.QtCore import Qt, Signal, QTimer, QAbstractNativeEventFilter
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFrame
 
 from .widgets import label, button, StatusLabel
 from . import icons
 from .. import chrome
 from ..config import log
+
+
+WM_ACTIVATE = 0x0006
+WM_PARENTNOTIFY = 0x0210
+_BUTTON_DOWN = {0x0201, 0x0204, 0x0207, 0x020B, 0x0246}   # L/R/M/X button down, WM_POINTERDOWN (touch, pen)
+
+
+class EmbedFocus(QAbstractNativeEventFilter):
+    """Keyboard focus for docked browser windows (single live view and Live Multi-View panes).
+
+    A docked Cent window is a child window of another process inside our Qt window. Clicking in it (a Hark chat
+    box, the address bar) sets the caret there, but Windows keeps the keyboard focus on the Qt top-level, so
+    typing, Ctrl+V, Backspace and Enter went to the Manager instead of that browser. Every button press in a
+    child window sends WM_PARENTNOTIFY up to our host widget: the browser window under the press gets the
+    focus right after it. Listeners (the Multi-View) are told which window got it, and when one of our
+    windows is activated by the keyboard or the taskbar (not by a click), so it can give the keys back."""
+    _inst = None
+
+    def __init__(self):
+        super().__init__()
+        self.listeners = []           # f(hwnd, ok): a docked browser window got (ok) the keyboard focus
+        self.activated = {}           # our top-level hwnd -> f(): activated by Alt+Tab / taskbar / code
+
+    @classmethod
+    def install(cls):
+        if cls._inst is None and QApplication.instance() is not None:
+            cls._inst = EmbedFocus()
+            QApplication.instance().installNativeEventFilter(cls._inst)
+        return cls._inst
+
+    def nativeEventFilter(self, etype, message):
+        try:
+            if etype == b"windows_generic_MSG" or etype == "windows_generic_MSG":
+                m = wintypes.MSG.from_address(int(message))
+                if m.message == WM_PARENTNOTIFY and (m.wParam & 0xFFFF) in _BUTTON_DOWN:
+                    child = chrome.embedded_child_at(m.hWnd, m.pt.x, m.pt.y)
+                    if child:
+                        # right now, before the browser handles the press itself: it then puts its own focus on
+                        # what was clicked (chat box, address bar) instead of restoring the page on WM_SETFOCUS
+                        self.focus(child)
+                elif m.message == WM_ACTIVATE and (m.wParam & 0xFFFF) == 1 and int(m.hWnd or 0) in self.activated:
+                    # WA_ACTIVE (WA_CLICKACTIVE = 2 is left to the click): after Windows focused the window itself
+                    QTimer.singleShot(0, self.activated[int(m.hWnd)])
+                elif m.message == WM_ACTIVATE and (m.wParam & 0xFFFF) == 2 and int(m.hWnd or 0) in self.activated:
+                    # activated by a click: when that click landed in a docked browser, its WM_PARENTNOTIFY came
+                    # while our window was not in the foreground yet, so give that browser the keys now
+                    root = int(m.hWnd)
+                    QTimer.singleShot(0, lambda: self.focus_under_cursor(root))
+        except Exception as e:
+            log(f"embed focus filter: {e}")
+        return False, 0
+
+    def focus_under_cursor(self, root):
+        import win32api
+        try:
+            x, y = win32api.GetCursorPos()
+            child = chrome.embedded_window_from_point(x, y, root)
+        except Exception:
+            child = None
+        if child:
+            self.focus(child)
+
+    def focus(self, hwnd):
+        ok = chrome.focus_embedded(hwnd)
+        for f in list(self.listeners):
+            try:
+                f(hwnd, ok)
+            except Exception:
+                pass
 
 
 class Host(QWidget):
@@ -21,6 +92,7 @@ class Host(QWidget):
 
     def __init__(self):
         super().__init__()
+        EmbedFocus.install()
         self.setAttribute(Qt.WA_NativeWindow, True)
         self.setAttribute(Qt.WA_DontCreateNativeAncestors, True)
         self.setMinimumSize(300, 200)
@@ -28,6 +100,11 @@ class Host(QWidget):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self.resized.emit()
+
+    def wheelEvent(self, e):
+        # a wheel over the docked browser belongs to that browser only (its chat scrolls); anything the browser
+        # passes back to its parent window must not scroll the Multi-View grid around it
+        e.accept()
 
 
 class BrowserView(QWidget):
@@ -147,6 +224,7 @@ class BrowserView(QWidget):
         self.expanded = not self.expanded
         self.b_exp.setText("  Collapse" if self.expanded else "  Expand")
         self.b_exp.setIcon(icons.icon("collapse" if self.expanded else "expand", 18))
+        self.b_exp.setProperty("hbm_icon", f"{'collapse' if self.expanded else 'expand'}:18")
         self.expand_toggled.emit(self.expanded)
         QTimer.singleShot(50, self.fit)
 

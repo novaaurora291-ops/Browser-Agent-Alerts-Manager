@@ -181,7 +181,7 @@ class AddProfileDialog(QDialog):
         self.t_single.setChecked(True)
         self.t_multi.setEnabled(self.managed)
         if not self.managed:
-            self.t_multi.setToolTip("Multiple profiles ke liye Settings mein Browser EXE Path set karein")
+            self.t_multi.setToolTip("Multiple profiles ke liye Settings mein Cent Browser Path set karein")
         self.t_single.toggled.connect(self._mode)
         tabs.addStretch(1)
         root.addLayout(tabs)
@@ -260,7 +260,7 @@ class AddProfileDialog(QDialog):
         self.b_manual.setChecked(not self.managed)
         self.b_auto.setEnabled(self.managed)
         if not self.managed:
-            self.b_auto.setToolTip("Auto sign-in sirf Settings ke Browser EXE Path wale profiles ke liye")
+            self.b_auto.setToolTip("Auto sign-in sirf Settings ke Cent Browser Path wale profiles ke liye")
         self.b_auto.toggled.connect(self._mode)
         form.addLayout(mh)
         form.addSpacing(4)

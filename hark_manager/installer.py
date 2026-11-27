@@ -9,11 +9,16 @@ from .config import log
 
 
 def _windows(p):
+    # only windows of the configured Cent exe running this profile's own --user-data-dir
     return chrome.managed_windows([p.data_dir]).get(chrome.norm_dir(p.data_dir), [])
 
 
 def _open_extensions_page(p, exe):
     import subprocess
+    if not exe or not chrome.is_cent_exe(exe) or (chrome.CENT_EXE and chrome.norm_path(exe) != chrome.CENT_EXE):
+        raise RuntimeError("Sirf configured Cent Browser mein bridge install hota hai")
+    if not p.data_dir or not p.managed:
+        raise RuntimeError("Sirf managed Cent profile")
     args = [exe, f"--user-data-dir={p.data_dir}", "--no-first-run", "about:blank"]
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -72,6 +77,11 @@ def install_bridge(p, ext_dir, exe=None):
     pythoncom.CoInitialize()
     if not os.path.isfile(os.path.join(ext_dir, "manifest.json")):
         return False, "Bridge folder nahi mila"
+    exe = exe or chrome.CENT_EXE
+    if not exe or not chrome.is_cent_exe(exe):
+        return False, "Cent Browser exe set nahi / ghalat (Settings)"
+    if os.path.normcase(os.path.abspath(ext_dir)) != os.path.normcase(os.path.abspath(os.path.join(p.data_dir, "_hbm_bridge"))):
+        return False, "Bridge sirf is profile ki apni _hbm_bridge copy se install hota hai"
     fg = win32gui.GetForegroundWindow()
     try:
         return _install(p, ext_dir, exe)

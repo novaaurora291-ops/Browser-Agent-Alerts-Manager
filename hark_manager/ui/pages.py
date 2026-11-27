@@ -3,7 +3,8 @@ import time
 
 import threading
 
-from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QRect, QObject
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QRect, QObject, QPointF
+from PySide6.QtGui import QPainter, QPainterPath, QPen, QColor, QBrush
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox, QPushButton,
                                QScrollArea, QFrame, QMenu, QInputDialog, QButtonGroup, QLineEdit, QMessageBox,
                                QSizePolicy, QFileDialog, QRubberBand)
@@ -130,6 +131,9 @@ class ProfileCard(Selectable, AlertPulse, QFrame):
         v.addLayout(top)
         self.status = StatusLabel("Idle")
         v.addWidget(self.status)
+        self.role = QLabel("")
+        self.role.setVisible(False)
+        v.addWidget(self.role, 0, Qt.AlignLeft)
         v.addWidget(self._make_result_row())
         self.preview = Preview()
         v.addWidget(self.preview, 1)
@@ -144,8 +148,18 @@ class ProfileCard(Selectable, AlertPulse, QFrame):
         self.name.setText(self.p.name)
         self.status.set_status(s)
         self.vpn.set_state(*c.vpn(self.p), who=self.p.name)
-        self.setObjectName("cardSel" if self.selected() else ("cardAlert" if s == "Needs reply" else "card"))
+        role = self.page.team_role(self.p)
+        self.setObjectName("cardSel" if self.selected() else ("cardAlert" if s == "Needs reply" else ("cardTeam" if role else "card")))
         self.set_pulse(s == "Needs reply" and not self.selected())
+        if role == "planner":
+            self.role.setText("\U0001F9E0  Planner (ChatGPT)")
+            self.role.setStyleSheet("background:#EAF8D2;border:1px solid #9BEA2C;border-radius:12px;padding:3px 12px;font-size:14px;font-weight:600")
+            self.role.setAccessibleName(f"Team role {self.p.name}: Planner (ChatGPT)")
+        elif role:
+            self.role.setText(role)
+            self.role.setStyleSheet("background:#F4FCE8;border:1px solid #C9EE95;border-radius:12px;padding:2px 10px;font-size:13px;font-weight:600;color:#2E6B00")
+            self.role.setAccessibleName(f"Team role {self.p.name}: worker {role}")
+        self.role.setVisible(bool(role))
         self.show_result()
         self._a11y()
         self.style().unpolish(self)
@@ -154,9 +168,11 @@ class ProfileCard(Selectable, AlertPulse, QFrame):
         if open_:
             self.action.setText("Focus window")
             self.action.setIcon(icons.icon("window", 18))
+            self.action.setProperty("hbm_icon", "window:18")
         else:
             self.action.setText("Launch")
             self.action.setIcon(icons.icon("play", 18))
+            self.action.setProperty("hbm_icon", "play:18")
         show = c.settings["show_previews"]
         mini = open_ and all(w[3] for w in c.windows.get(self.p.directory, []))
         ph = "Closed" if not open_ else ("Minimized" if mini else ("Previews off" if not show else "Loading preview…"))
@@ -258,6 +274,7 @@ class ProfileRow(Selectable, AlertPulse, QFrame):
         open_ = bool(c.windows.get(self.p.directory))
         self.action.setText("Focus window" if open_ else "Launch")
         self.action.setIcon(icons.icon("window" if open_ else "play", 18))
+        self.action.setProperty("hbm_icon", f"{'window' if open_ else 'play'}:18")
         self.prev.set_png(c.previews.get(self.p.directory) if open_ and c.settings["show_previews"] else None, "" if open_ else "")
 
 
@@ -303,6 +320,133 @@ class ClosedRow(QFrame):
         self.name.setText(self.p.name)
 
 
+class TeamOverlay(QWidget):
+    """Lime Bezier lines + connection dots between the Shared Repo Team's cards and the repo badge.
+    A child of the scrolled cards widget, so it moves with the cards on scroll and is re-laid on every resize."""
+    LIME = QColor("#7BD21A")
+
+    def __init__(self, page, holder):
+        super().__init__(holder)
+        self.page = page
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.badge = QLabel(holder)
+        self.badge.setObjectName("repoBadge")
+        self.badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.badge.setStyleSheet("QLabel#repoBadge{background:white;border:2px solid #9BEA2C;border-radius:19px;"
+                                 "padding:6px 18px;font-size:16px;font-weight:600;color:#111418;}")
+        self.badge.hide()
+        self.hide()
+        self.links = None     # (planner card or None, [worker cards])
+
+    def sync(self):
+        """Recompute from the page's current cards; hide when no team card is visible."""
+        page = self.page
+        pid, wids = page.ctl.team_profile_ids()
+        cards = {w.p.tag: w for w in page.items.values() if isinstance(w, ProfileCard)}
+        planner = cards.get(pid)
+        workers = [cards[t] for t in wids if t in cards]
+        if page.tab != "open" or page.ctl.settings["view_mode"] != "grid" or (not workers and not planner) or not pid:
+            self.links = None
+            self.hide()
+            self.badge.hide()
+            return
+        for c in ([planner] if planner else []) + workers:
+            c.installEventFilter(self)
+        self.links = (planner, workers)
+        self.badge.setText(page.repo_badge_text())
+        self.badge.setAccessibleName(page.repo_badge_text())
+        self.badge.adjustSize()
+        self.setGeometry(self.parentWidget().rect())
+        self.show()
+        self.badge.show()
+        self.raise_()
+        self.badge.raise_()
+        self.place_badge()
+        self.update()
+
+    def eventFilter(self, obj, e):
+        if e.type() in (QEvent.Move, QEvent.Resize, QEvent.Show, QEvent.Hide) and self.links:
+            QTimer.singleShot(0, self.relayout)
+        return False
+
+    def relayout(self):
+        if not self.links:
+            return
+        try:
+            self.setGeometry(self.parentWidget().rect())
+            self.place_badge()
+            self.update()
+        except RuntimeError:
+            self.links = None
+
+    def _anchor(self):
+        planner, workers = self.links
+        gs = [w.geometry() for w in workers if w.isVisible()]
+        bw, bh = self.badge.width(), self.badge.height()
+        if planner is not None and planner.isVisible():
+            pg = planner.geometry()
+            cx = pg.center().x()
+            below = [g for g in gs if g.top() >= pg.bottom()]
+            cy = (pg.bottom() + min(g.top() for g in below)) / 2 if below else pg.bottom() + bh / 2 + 10
+        elif gs:
+            cx = sum(g.center().x() for g in gs) / len(gs)
+            cy = min(g.top() for g in gs) - bh / 2 - 10
+        else:
+            return None
+        cx = max(bw / 2 + 4, min(self.width() - bw / 2 - 4, cx))
+        return QPointF(cx, max(bh / 2 + 2, cy))
+
+    def place_badge(self):
+        a = self._anchor()
+        if a is None:
+            self.badge.hide()
+            return
+        self.badge.move(int(a.x() - self.badge.width() / 2), int(a.y() - self.badge.height() / 2))
+
+    def paintEvent(self, e):
+        if not self.links:
+            return
+        a = self._anchor()
+        if a is None:
+            return
+        planner, workers = self.links
+        qp = QPainter(self)
+        qp.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(self.LIME, 3)
+        pen.setCapStyle(Qt.RoundCap)
+        qp.setPen(pen)
+        qp.setBrush(Qt.NoBrush)
+        bh = self.badge.height()
+        top, bot = QPointF(a.x(), a.y() - bh / 2), QPointF(a.x(), a.y() + bh / 2)
+        dots = []
+        if planner is not None and planner.isVisible():
+            g = planner.geometry()
+            d = QPointF(g.center().x(), g.bottom() + 1)
+            path = QPainterPath(d)
+            path.cubicTo(QPointF(d.x(), (d.y() + top.y()) / 2), QPointF(top.x(), (d.y() + top.y()) / 2), top)
+            qp.drawPath(path)
+            dots.append(d)
+        for w in workers:
+            if not w.isVisible():
+                continue
+            g = w.geometry()
+            if g.top() >= a.y():
+                d, s0 = QPointF(g.center().x(), g.top() - 1), bot
+            else:
+                d, s0 = QPointF(g.center().x(), g.bottom() + 1), top
+            h = d.y() - s0.y()
+            path = QPainterPath(s0)
+            path.cubicTo(QPointF(s0.x(), s0.y() + h * 0.55), QPointF(d.x(), d.y() - h * 0.75), d)
+            qp.drawPath(path)
+            dots.append(d)
+        qp.setPen(QPen(QColor("white"), 2))
+        qp.setBrush(QBrush(self.LIME))
+        for d in dots:
+            qp.drawEllipse(d, 7, 7)
+        qp.end()
+
+
 class _Relay(QObject):
     result = Signal(str, str, str, str)     # profile dir, kind, text, detail (from worker threads)
 
@@ -324,6 +468,8 @@ class ProfilesPage(QWidget):
         self.relay = _Relay()
         self.relay.result.connect(self.set_result)
         ctl.limit_result.connect(self.on_limit)
+        ctl.refresh_progress.connect(self.on_refresh_progress)
+        ctl.refresh_done.connect(self.on_refresh_done)
         v = QVBoxLayout(self)
         v.setContentsMargins(24, 22, 24, 10)
         v.setSpacing(18)
@@ -334,11 +480,17 @@ class ProfilesPage(QWidget):
         self.refresh_btn = button("  Refresh", "outline", "refresh", 18)
         self.refresh_btn.setMinimumHeight(40)
         self.refresh_btn.setStyleSheet("font-size:15px; padding: 6px 16px;")
-        self.refresh_btn.setToolTip("Sab Cent profiles ka live Hark status dobara check karo")
+        self.refresh_btn.setToolTip("Har open Cent profile ka fresh VPN, Hark activity aur Check Limit (read-only)")
         self.refresh_btn.setAccessibleName("Refresh profile statuses")
         self.refresh_btn.clicked.connect(self.recheck_status)
         head.addWidget(self.refresh_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
         v.addLayout(head)
+        self.cent_banner = QLabel()
+        self.cent_banner.setObjectName("banner")
+        self.cent_banner.setWordWrap(True)
+        self.cent_banner.setAccessibleName("Cent Browser error")
+        self.cent_banner.hide()
+        v.addWidget(self.cent_banner)
         tabs = QHBoxLayout()
         tabs.setSpacing(0)
         self.t_open = QPushButton("Open")
@@ -384,6 +536,7 @@ class ProfilesPage(QWidget):
             b.setObjectName("seg")
             b.setCheckable(True)
             b.setIcon(icons.icon(ic, 22))
+            b.setProperty("hbm_icon", f"{ic}:22")
             b.setFixedSize(64, 42)
             b.setCursor(Qt.PointingHandCursor)
             seg.addWidget(b)
@@ -428,25 +581,92 @@ class ProfilesPage(QWidget):
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.viewport().installEventFilter(self)
         v.addWidget(self.scroll, 1)
+        self.overlay = TeamOverlay(self, self.holder)
         self.cols = 3
         ctl.changed.connect(self.refresh)
+        ctl.team_changed.connect(self.rebuild)
         ctl.previews_changed.connect(self.refresh)
         self.rebuild()
 
+    def team_role(self, p):
+        """'planner', the worker's @alias, or '' for a profile outside the Shared Repo Team."""
+        from .. import repo_team
+        t = self.ctl.team()
+        if not repo_team.is_configured(t):
+            return ""
+        if (t.get("planner") or {}).get("profile_id") == p.tag:
+            return "planner"
+        for w in t.get("workers") or []:
+            if w.get("profile_id") == p.tag:
+                return w.get("alias") or "worker"
+        return ""
+
+    def repo_badge_text(self):
+        from .. import repo_team
+        t = self.ctl.team()
+        n = len(t.get("workers") or []) + (1 if (t.get("planner") or {}).get("profile_id") else 0)
+        name = repo_team.repo_name(t.get("repo_path"))
+        res = self.ctl.worktrees_ok
+        if self.ctl.worktrees_ready():
+            state = "Worktrees Ready"
+        elif not res:
+            state = "Worktrees not verified"
+        else:
+            state = f"{sum(1 for r in res.values() if not r[0])} Worktree(s) Blocked"
+        return f"\U0001F517 Repo: {name} ({n} Linked \u2022 {state})"
+
     def recheck_status(self):
-        """Refresh button: ask every Cent profile's bridge for its live Hark state now, then sync cards + Needs reply."""
+        """Refresh button: for every open Cent profile get a FRESH VPN status, Hark activity (Needs reply / Running /
+        Idle) and the read-only Check Limit result, then sync the cards and the Needs reply panel. A check with
+        no fresh answer in this refresh shows Unknown. Read-only: nothing is typed or clicked in Hark."""
         b = self.refresh_btn
         if not b.isEnabled():
             return
+        if not self.ctl.fresh_refresh():
+            return
         b.setEnabled(False)
         b.setText("  Checking…")
+        for k in self.ctl.fr.get("res", {}):
+            self.set_result(k, "run", "Refreshing…", "VPN · activity · limit")
 
-        def done(summary):
-            b.setText("  Refresh")
-            b.setEnabled(True)
-            b.setToolTip(f"Last check: {summary}")
-            self.rebuild()
-        self.ctl.recheck_all(done)
+    def on_refresh_progress(self, n, total):
+        if not self.refresh_btn.isEnabled():
+            self.refresh_btn.setText(f"  Checking… {n}/{total}")
+
+    def on_refresh_done(self, out):
+        b = self.refresh_btn
+        b.setText("  Refresh")
+        b.setEnabled(True)
+        unk = 0
+        for k, r in out.items():
+            if r["limit"] == "unknown":
+                self.set_result(k, "info", "Limit: Unknown", "Is Refresh mein jawab nahi aaya")
+            elif isinstance(r["limit"], dict) and r["limit"].get("planner"):
+                self.set_result(k, "info", "Planner (ChatGPT)", "Hark limit check skip")
+            if "unknown" in (r["vpn"], r["activity"], r["limit"]):
+                unk += 1
+        counts = {}
+        for k, r in out.items():
+            counts[r["activity"]] = counts.get(r["activity"], 0) + 1
+        summary = ", ".join(f"{a} {n}" for a, n in counts.items()) or "no open profiles"
+        b.setToolTip(f"Last refresh {time.strftime('%H:%M:%S')}: {summary}" + (f" · {unk} with Unknown" if unk else ""))
+        self.rebuild()
+        # what each card shows now (names + results only, no secrets): for checking the Refresh by hand / tests
+        try:
+            import json
+            rows = {}
+            for k, r in out.items():
+                p = self.ctl.profile(k)
+                res = self.results.get(k) or ("", "", "")
+                rows[r["name"]] = {"vpn": r["vpn"], "activity": r["activity"],
+                                   "card_status": self.ctl.status(p) if p else "",
+                                   "card_vpn": " ".join(x for x in self.ctl.vpn(p) if x) if p else "",
+                                   "limit": f"{res[1]} {res[2]}".strip()}
+            with open(os.path.join(config.APPDATA, "last_refresh.json"), "w", encoding="utf-8") as f:
+                json.dump({"t": time.time(), "profiles": rows,
+                           "needs_reply": [a["profile_name"] for a in self.ctl.alerts.open_alerts()]}, f, indent=1)
+        except Exception as e:
+            config.log(f"last_refresh.json: {e}")
 
     def set_tab(self, t):
         self.tab = t
@@ -488,7 +708,9 @@ class ProfilesPage(QWidget):
         if self.tab == "closed":
             return sorted(out, key=lambda p: (p.managed, p.name.lower()))
         rank = {"Needs reply": 0, "Running": 1, "Idle": 2, "Closed": 3}
-        return sorted(out, key=lambda p: rank.get(self.ctl.status(p), 9))
+        _, wids = self.ctl.team_profile_ids()
+        # team workers go last, in team order, so their linked cards sit together under the planner
+        return sorted(out, key=lambda p: (1, wids.index(p.tag), 0) if p.tag in wids else (0, 0, rank.get(self.ctl.status(p), 9)))
 
     def update_counts(self):
         hid = set(self.ctl.settings["hidden_profiles"] or [])
@@ -511,15 +733,19 @@ class ProfilesPage(QWidget):
         self.update_counts()
         self.selected &= {p.directory for p in ps} if self.tab == "open" else set()
         self._sel_text()
+        self._cent_banner()
         if self.tab == "closed":
+            self.overlay.sync()
             return self._build_closed(ps)
+        cells = self._team_cells(ps) if mode == "grid" else None
         for i, p in enumerate(ps):
             if mode == "list":
                 w = ProfileRow(self, p)
                 self.grid.addWidget(w, i, 0)
             else:
                 w = ProfileCard(self, p)
-                self.grid.addWidget(w, i // self.cols, i % self.cols)
+                r, c = cells[p.directory] if cells else (i // self.cols, i % self.cols)
+                self.grid.addWidget(w, r, c)
             self.items[p.directory] = w
             w.refresh()
         if not ps:
@@ -529,6 +755,46 @@ class ProfilesPage(QWidget):
             # only real columns stretch (equal widths); empty columns must not eat space
             self.grid.setColumnStretch(c, 1 if c < ncols else 0)
         self.grid.setRowStretch(self.grid.rowCount(), 1)
+        pid, wids = self.ctl.team_profile_ids()
+        team_here = mode == "grid" and any(getattr(w, "p", None) is not None and w.p.tag in wids + [pid] for w in self.items.values())
+        self.grid.setVerticalSpacing(74 if team_here else 18)   # room for the repo badge between rows
+        # no Planner card in view (closed / filtered): the badge sits above the first worker row, so that row
+        # needs room above it too, otherwise the badge covers the top cards' names
+        planner_here = any(getattr(w, "p", None) is not None and w.p.tag == pid for w in self.items.values())
+        m = self.grid.contentsMargins()
+        self.grid.setContentsMargins(m.left(), 64 if team_here and not planner_here else 0, m.right(), m.bottom())
+        QTimer.singleShot(0, self.overlay.sync)
+
+    def _team_cells(self, ps):
+        """Grid cells when a Shared Repo Team is visible: the Planner in the middle of the row right above its
+        workers (like the mock-up), the workers together on the next row(s), every other profile around them."""
+        pid, wids = self.ctl.team_profile_ids()
+        workers = [p for p in ps if p.tag in wids]
+        planner = next((p for p in ps if p.tag == pid), None)
+        if not workers and not planner:
+            return None
+        cols = max(1, self.cols)
+        others = [p for p in ps if p not in workers and p is not planner]
+        cells, row = {}, 0
+        if planner is not None:
+            mid = cols // 2
+            free = [c for c in range(cols) if c != mid]
+            cells[planner.directory] = (0, mid)
+            for c in free:
+                if others:
+                    cells[others.pop(0).directory] = (0, c)
+            row = 1
+        for i, p in enumerate(workers):
+            cells[p.directory] = (row + i // cols, i % cols)
+        row += (len(workers) + cols - 1) // cols
+        for i, p in enumerate(others):
+            cells[p.directory] = (row + i // cols, i % cols)
+        return cells
+
+    def _cent_banner(self):
+        err = self.ctl.cent_error
+        self.cent_banner.setText("\u26A0 " + err if err else "")
+        self.cent_banner.setVisible(bool(err))
 
     def _build_closed(self, ps):
         for c in range(8):
@@ -569,6 +835,10 @@ class ProfilesPage(QWidget):
         self.update_counts()
         for w in self.items.values():
             w.refresh()
+        if self.overlay.links:
+            t = self.repo_badge_text()
+            if self.overlay.badge.text() != t:
+                self.overlay.sync()
 
     CARD_MIN = 260
     GAP = 18
@@ -617,6 +887,8 @@ class ProfilesPage(QWidget):
     def eventFilter(self, obj, e):
         if obj is self.scroll.viewport() and e.type() == QEvent.Resize:
             self._update_cols()
+        if obj is self.holder and e.type() in (QEvent.Resize, QEvent.LayoutRequest) and getattr(self, "overlay", None):
+            QTimer.singleShot(0, self.overlay.relayout)
         if obj is self.holder and self.tab == "open":
             t = e.type()
             if t == QEvent.MouseButtonPress and e.button() == Qt.LeftButton:
@@ -789,6 +1061,8 @@ class ProfilesPage(QWidget):
 
     def on_limit(self, k, res):
         cid = res.get("id")
+        fr = self.ctl.fr
+        late = isinstance(cid, str) and cid in (fr.get("cid") or {}) and not fr.get("running")
         if cid in self._checks:
             self._checks.pop(cid, None)
         tabs = [t for t in (res.get("tabs") or []) if t and not t.get("err")]
@@ -808,6 +1082,8 @@ class ProfilesPage(QWidget):
             out = ("fail", "Not ready", "Hark tab nahi mila")
         else:
             out = ("fail", "Not ready", "Hark chat load nahi hui")
+        if late:
+            out = (out[0], out[1], (out[2] + " · " if out[2] else "") + "late answer, after Refresh")
         config.log(f"check limit {k}: {out[1]} {out[2]} tabs={[(t.get('url','')[:40], t.get('reached'), t.get('loaded'), t.get('active')) for t in tabs]}")
         self.set_result(k, *out)
 
@@ -833,7 +1109,7 @@ class ProfilesPage(QWidget):
                     config.log(f"bridge install {k}: already installed, skipped")
                     emit(k, "ok", "Already installed", "Skip kiya")
                     continue
-                ext = config.ensure_profile_extension(p.data_dir, p.tag) if p.managed else config.ensure_extension()
+                ext = config.ensure_profile_extension(p.data_dir, p.tag)     # Cent managed profiles only
                 t0 = time.time()
                 emit(k, "run", "Installing…", "Extensions · Load unpacked")
                 ok, msg = installer.install_bridge(p, ext, self.ctl.exe_for(p))
@@ -1098,7 +1374,34 @@ class SettingsPage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(24, 22, 24, 18)
         outer.setSpacing(14)
-        outer.addWidget(label("Settings", obj="h1"))
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        head.addWidget(label("Settings", obj="h1"))
+        head.addStretch(1)
+        head.addWidget(label("Theme", size=18))
+        seg = QHBoxLayout()
+        seg.setSpacing(0)
+        self.th_light = QPushButton("\u263C  Light")
+        self.th_dark = QPushButton("\u263E  Dark")
+        tg = QButtonGroup(self)
+        for b, rad in ((self.th_light, "border-top-left-radius:9px;border-bottom-left-radius:9px;"),
+                       (self.th_dark, "border-top-right-radius:9px;border-bottom-right-radius:9px;")):
+            b.setObjectName("seg")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setMinimumSize(104, 40)
+            b.setStyleSheet("font-size:16px;font-weight:600;" + rad)
+            tg.addButton(b)
+            seg.addWidget(b)
+        self.th_light.setAccessibleName("Theme Light")
+        self.th_dark.setAccessibleName("Theme Dark")
+        self.th_light.setToolTip("Light theme (Save changes se save hota hai)")
+        self.th_dark.setToolTip("Dark theme: charcoal, safed text, lime controls (Save changes se save hota hai)")
+        # shown at once across the whole Manager; Save changes keeps it, Cancel goes back to the saved one
+        self.th_light.clicked.connect(lambda: self.preview_theme("light"))
+        self.th_dark.clicked.connect(lambda: self.preview_theme("dark"))
+        head.addLayout(seg)
+        outer.addLayout(head)
         self.banner = QLabel()
         self.banner.setObjectName("banner")
         self.banner.setWordWrap(True)
@@ -1214,7 +1517,24 @@ class SettingsPage(QWidget):
         v4.addWidget(row("Open task on alert click", self.t_click)); v4.addWidget(hline())
         v4.addWidget(row("Play alert sound", self.t_sound))
         g.addWidget(c4, 1, 1)
-        for c in (c1, c2, c3, c4):
+
+        # Shared Repo Team
+        c5, v5 = section("Shared Repo Team", "Planner + workers on one local git repo, a worktree per worker")
+        self.team_lbl = label("", size=14, color="#5B616B")
+        self.team_lbl.setWordWrap(True)
+        self.team_lbl.setAccessibleName("Shared Repo Team summary")
+        v5.addWidget(self.team_lbl)
+        tb5 = QHBoxLayout()
+        self.team_btn = button("Edit team…", "outline")
+        self.team_btn.setMinimumHeight(40)
+        self.team_btn.setAccessibleName("Edit Shared Repo Team")
+        self.team_btn.clicked.connect(self.edit_team)
+        tb5.addWidget(self.team_btn)
+        tb5.addStretch(1)
+        v5.addLayout(tb5)
+        g.addWidget(c5, 2, 0, 1, 2)
+        ctl.team_changed.connect(self._team_summary)
+        for c in (c1, c2, c3, c4, c5):
             c.setMinimumWidth(0)
             c.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         g.setColumnStretch(0, 1)
@@ -1237,8 +1557,22 @@ class SettingsPage(QWidget):
         ctl.telegram_status.connect(self.on_tg)
         self.load()
 
+    def preview_theme(self, name):
+        from . import style
+        self.th_light.setChecked(name == "light")
+        self.th_dark.setChecked(name == "dark")
+        style.apply_theme(name)
+        config.log(f"theme: {name} (shown, not saved yet)")
+
     def load(self):
         s = self.ctl.settings
+        saved = s["theme"] if s["theme"] in ("light", "dark") else "light"
+        self.th_light.setChecked(saved == "light")
+        self.th_dark.setChecked(saved == "dark")
+        from . import style
+        if style.theme() != saved:
+            style.apply_theme(saved)          # Cancel: back to the saved theme
+            config.log(f"theme: back to saved {saved}")
         self.exe.setText(s["browser_exe"] or "")
         self._exe_hint()
         self.refresh_cb.setCurrentText(f"{s['preview_refresh']} seconds")
@@ -1268,6 +1602,28 @@ class SettingsPage(QWidget):
         self.t_sound.setChecked(bool(s["play_sound"]))
         self.test_res.setText("")
         self.on_tg(self.ctl.tg_ok, self.ctl.tg_msg)
+        ok, err = self.ctl.cent_status()
+        if not ok:
+            self.banner.setText("\u26A0 Cent Browser: " + err)
+            self.banner.setAccessibleName("Cent Browser error")
+            self.banner.show()
+        self._team_summary()
+
+    def _team_summary(self):
+        from .. import repo_team
+        t = self.ctl.team()
+        if not repo_team.is_configured(t):
+            self.team_lbl.setText("Team set nahi. Edit team… se repo, Planner aur workers chunein.")
+            return
+        names = {p.tag: p.name for p in self.ctl.profiles}
+        pl = t.get("planner") or {}
+        ws = ", ".join(f"{w['alias']} = {names.get(w.get('profile_id'), w.get('profile_id'))}" for w in t["workers"])
+        self.team_lbl.setText(f"Repo: {t['repo_path']}  •  base {t.get('base_ref')} ({(t.get('base_sha') or '')[:10]})\n"
+                              f"Planner: {names.get(pl.get('profile_id'), '-')}  •  Workers: {ws}")
+
+    def edit_team(self):
+        from .team_dispatch import open_team_dialog
+        open_team_dialog(self.ctl, self)
 
     def pick_exe(self):
         start = os.path.dirname(self.exe.text().strip()) or chrome_mod.detect_cent() or os.environ.get("LOCALAPPDATA", "C:\\")
@@ -1279,11 +1635,11 @@ class SettingsPage(QWidget):
         exe = self.exe.text().strip().strip('"')
         if not exe:
             found = chrome_mod.detect_cent()
-            self.exe_hint.setText(f"Khud mila: {found}" if found else "Cent Browser nahi mila. Browse karke Cent ki chrome.exe chunein.")
+            self.exe_hint.setText(f"Khud mila: {found}" if found else "\u26A0 Cent Browser nahi mila. Browse karke Cent ki chrome.exe chunein.")
         elif not os.path.isfile(exe):
-            self.exe_hint.setText("Yeh file nahi mili.")
+            self.exe_hint.setText("\u26A0 Cent Browser exe nahi mili (file missing). Sahi Cent chrome.exe chunein.")
         elif not chrome_mod.is_cent_exe(exe):
-            self.exe_hint.setText("Yeh Cent Browser nahi hai. Sirf Cent Browser supported hai (Chrome, Edge, Brave nahi).")
+            self.exe_hint.setText("\u26A0 Yeh Cent Browser nahi hai. Sirf Cent Browser supported hai (Chrome, Edge, Brave nahi).")
         else:
             self.exe_hint.setText(f"Cent Browser. Har profile ka alag folder: {config.browser_profiles_dir()}")
 
@@ -1317,8 +1673,13 @@ class SettingsPage(QWidget):
         s["desktop_alerts"] = self.t_desk.isChecked()
         s["open_task_on_click"] = self.t_click.isChecked()
         s["play_sound"] = self.t_sound.isChecked()
+        s["theme"] = "dark" if self.th_dark.isChecked() else "light"
         s.save()
+        config.log(f"theme saved: {s['theme']}")
         self.ctl.reload_profiles()        # Cent path may have changed: only profiles of that Cent are listed
+        ok, err = self.ctl.cent_status()
+        if not ok:
+            QMessageBox.warning(self, "Cent Browser Path", err)
         self.ctl.apply_preview_interval()
         self.banner.hide()
         self.load()
