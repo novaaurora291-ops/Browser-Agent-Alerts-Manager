@@ -55,5 +55,6 @@ def main():
         win.hide()
     else:
         win.show()
-    log("started")
+    from .version import version_text
+    log(f"started {version_text()} from {sys.argv[0]}")
     return app.exec()

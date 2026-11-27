@@ -8,6 +8,7 @@ from .widgets import card, label, button, IconLabel, Dot
 from .style import build_qss, ORANGE, GREEN, GRAY
 from .. import config
 from ..config import APP_TITLE
+from ..version import version_text
 
 
 class NavButton(QPushButton):
@@ -110,7 +111,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.ctl = ctl
         self.quitting = False
-        self.setWindowTitle(APP_TITLE)
+        self.version = version_text()          # e.g. v1.0.4 (0ce8437): which code is running
+        self.setWindowTitle(f"{APP_TITLE}  {self.version}")
         self.setWindowIcon(icons.icon("logo", 32))
         self.resize(1680, 980)
         self.setMinimumSize(1180, 720)
@@ -137,6 +139,10 @@ class MainWindow(QMainWindow):
         self.badge.setObjectName("badge")
         self.badge.move(160, 15)
         sv.addStretch(1)
+        self.ver_lbl = label(self.version, obj="muted")
+        self.ver_lbl.setAccessibleName("App version")
+        self.ver_lbl.setToolTip("App version aur commit (GitHub par yahi SHA hona chahiye)")
+        sv.addWidget(self.ver_lbl)
         h.addWidget(side)
 
         self.stack = QStackedWidget()
