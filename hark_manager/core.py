@@ -9,6 +9,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 from . import chrome, notify, config, repo_team
 from .alerts import AlertStore
+from .api_dispatch import ApiDispatcher
 from .bridge import Bridge
 from .config import Settings, get_bot_token, log
 
@@ -69,6 +70,7 @@ class Controller(QObject):
     team_changed = Signal()            # Shared Repo Team saved / worktrees verified
     verify_done = Signal(str, dict)    # verify id, result
     dispatch_update = Signal(str, dict)  # dispatch id, record
+    mock_changed = Signal()              # local mock Hark: a profile's mock session switched account
     refresh_progress = Signal(int, int)  # profiles fully answered, profiles asked (Profiles page Refresh)
     refresh_done = Signal(dict)          # profile_dir -> {"vpn", "activity", "limit"}: fresh value or "unknown"
 
@@ -84,6 +86,9 @@ class Controller(QObject):
         self.sent_keys = {}   # (tag, url, sha256(prompt)) -> dispatch id: the same prompt is never sent twice
         self.worktrees_ok = {}  # alias -> (ok, reason) from the last git check
         self._load_dispatches()  # Sent / Unconfirmed survive a restart: the same prompt is never sent twice
+        self.mock = None      # local mock Hark (started on first use of the Local Mock target)
+        self.mock_synced = {}  # Cent profile tag -> mock account id sync_mock last signed it in to
+        self.api = ApiDispatcher(self.api_transport)
         self.cent_error = ""
         self.fr = {}          # last Profiles-page Refresh: {"t0", "end", "running", "res": {dir: {check: value}}}
         self.profiles = []
@@ -666,7 +671,19 @@ class Controller(QObject):
         p = self.profile(a["profile_dir"])
         if not p:
             return
-        url = a["conv_url"] or "https://hark.com/chat"
+        self._show_url(p, a["conv_url"] or "https://hark.com/chat")
+        log(f"open_task {a['qid']} -> {p.directory} {a['conv_url'] or 'chat'}")
+
+    def open_project(self, tag, url):
+        """Team card 'Open Project': that worker's Cent profile on its exact Hark project. Nothing is typed or sent."""
+        p = self.by_tag.get(tag)
+        if not p or not repo_team.PROJECT_URL_RE.match(url or ""):
+            return False
+        self._show_url(p, url)
+        log(f"open_project -> {tag} {url}")
+        return True
+
+    def _show_url(self, p, url):
         open_ = bool(self.windows.get(p.directory)) or p.directory in self.embedded
         if open_ and self.bridge_live(p):
             # the extension finds the tab of that exact chat (or opens it) and activates it
@@ -675,7 +692,6 @@ class Controller(QObject):
             self.open_in(p, url)
             QTimer.singleShot(1500, self.refresh_windows)
         self.view_request.emit(p.directory, "Hark")
-        log(f"open_task {a['qid']} -> {p.directory} {url}")
 
     def set_managed_field(self, tag, key, value):
         recs = list(self.settings["managed_profiles"] or [])
@@ -911,6 +927,7 @@ class Controller(QObject):
         team, res = repo_team.setup_worktrees(team)
         repo_team.save(self.settings, team)
         self.worktrees_ok = res
+        self.sync_mock()
         self.team_changed.emit()
         return team, res
 
@@ -924,6 +941,118 @@ class Controller(QObject):
         t = self.team()
         ws = t.get("workers") or []
         return bool(ws) and all((self.worktrees_ok.get(w.get("alias")) or (False,))[0] for w in ws)
+
+    def worker_account(self, w):
+        """(email, source) of the Hark account this worker must use: the team's account, else the Hark email the
+        profile saved at setup. ("", "") when neither is known."""
+        if (w or {}).get("account"):
+            return w["account"].strip().lower(), "team"
+        p = self.by_tag.get((w or {}).get("profile_id") or "")
+        if p and p.email:
+            return p.email.strip().lower(), "profile"
+        return "", ""
+
+    # ---------- Team Dispatch targets: Real Hark (manual send), Local Mock (automatic), Live API (blocked) ----------
+    LIVE_API_APPROVED = False   # True only after Hark grants approved API access; until then nothing calls hark.com
+    LIVE_BASE = "https://hark.com"
+    MOCK_SPARE = "switched.account@mock.hark.local"   # a mock account that owns no team project
+    MOCK_REPLY_DELAY = 2.0
+
+    def dispatch_target(self):
+        t = self.settings.data.get("team_dispatch_target")
+        return t if t in ("real", "mock") else "real"
+
+    def set_dispatch_target(self, target):
+        if target not in ("real", "mock"):
+            return False
+        self.settings["team_dispatch_target"] = target
+        self.settings.save()
+        if target == "mock":
+            self.mock_hark()
+        return True
+
+    def live_status(self):
+        if self.LIVE_API_APPROVED:
+            return "approved", "Live API: approved access configured"
+        return "blocked", "Live API: BLOCKED \u2014 Hark ki approved access nahi mili, koi live call nahi hoti"
+
+    def mock_hark(self):
+        if self.mock is None:
+            from .mock_hark import MockHark
+            self.mock = MockHark(reply_delay=self.MOCK_REPLY_DELAY)
+            self.mock_synced = {}
+            self.mock.start()
+            log(f"mock hark started on {self.mock.base_url}")
+        self.sync_mock()
+        return self.mock
+
+    def sync_mock(self):
+        """Mirror the team into the mock: every worker account is a mock account owning its worker's project (team
+        project URLs are unique), and each worker's Cent profile is signed in to its account. A profile switched by
+        hand stays switched; one still on the account this sync gave it follows a changed team account."""
+        m = self.mock
+        if m is None:
+            return
+        m.add_account(self.MOCK_SPARE)
+        for w in self.team().get("workers") or []:
+            acc, _ = self.worker_account(w)
+            pid = repo_team.project_id(w.get("project_url"))
+            tag = w.get("profile_id")
+            if not acc or not tag:
+                continue
+            uid = m.add_account(acc)
+            if pid and not m.add_project(pid, uid, title=f"{w.get('alias')} project"):
+                m.set_owner(pid, uid)
+                log(f"mock: project {pid[:8]} moved to {w.get('alias')}'s current account")
+            cur = m.signed_in(tag)
+            if cur is None or (cur["id"] != uid and cur["id"] == self.mock_synced.get(tag)):
+                m.sign_in(tag, uid)
+            self.mock_synced[tag] = uid
+
+    def mock_accounts(self):
+        m = self.mock_hark()
+        with m.lock:
+            return sorted(a["email"] for a in m.accounts.values())
+
+    def mock_session(self, tag):
+        m = self.mock
+        s = m.signed_in(tag) if m else None
+        return s["email"] if s else ""
+
+    def mock_switch_account(self, tag, email=None):
+        """Switch the mock session of this Cent profile to another mock account (the next one when email is None):
+        the profile's old session ends, like signing out and in again in that same browser profile."""
+        from .mock_hark import user_id_for
+        m = self.mock_hark()
+        accs = self.mock_accounts()
+        if email is None:
+            cur = self.mock_session(tag)
+            email = accs[(accs.index(cur) + 1) % len(accs)] if cur in accs else accs[0]
+        email = email.strip().lower()
+        if email not in accs:
+            raise KeyError(email)
+        m.sign_in(tag, user_id_for(email))
+        log(f"mock: profile {tag} switched to {email}")
+        self.mock_changed.emit()
+        return email
+
+    def stop_api(self):
+        self.api.shutdown()
+        if self.mock is not None:
+            self.mock.stop()
+            self.mock = None
+
+    def api_transport(self, target, tag):
+        """Called from dispatch threads: never starts or re-syncs the mock (the UI thread does that first)."""
+        from .hark_api import HarkApi, HarkApiError
+        if target == "mock":
+            m = self.mock
+            if m is None:
+                raise HarkApiError("Local mock Hark chal nahi raha", code="mock_off", maybe_delivered=False)
+            return HarkApi(m.base_url, lambda: m.cookie_header(tag), timeout=5)
+        if target == "live":
+            return HarkApi(self.LIVE_BASE, lambda: {}, live_approved=self.LIVE_API_APPROVED)
+        raise ValueError(f"no API transport for target {target!r} (Real Hark is sent by hand)")
 
     # ---------- Safe Dispatch (bridge side) ----------
     VERIFY_TIMEOUT = 35     # s for a profile's bridge to answer a fresh tab check (it reports every <= 30 s)

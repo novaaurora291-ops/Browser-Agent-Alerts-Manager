@@ -3,7 +3,7 @@ import os
 import subprocess
 import sys
 
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.6"
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
