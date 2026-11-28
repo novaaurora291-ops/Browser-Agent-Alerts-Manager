@@ -5,7 +5,10 @@ Saved in Settings["repo_team"]:
     {"repo_path": "D:\\Code\\GeoFrost-App", "base_ref": "HEAD", "base_sha": "<40 hex>", "worktree_root": "",
      "planner": {"profile_id": "2223e6", "alias": "@cent1", "project_url": ""},
      "workers": [{"profile_id": "447193", "alias": "@cent2", "project_url": "https://hark.com/project/<id>",
+                  "account": "worker@example.com",
                   "branch": "agent-cent2", "worktree": "D:\\Code\\GeoFrost-App-worktrees\\cent2"}]}
+
+"account" is the Hark account the worker must be signed in to; empty = the profile's saved Hark email.
 
 Profiles are referenced by their stable managed profile ID (the tag in settings.managed_profiles), never by name.
 Every git call uses an argument list with shell=False. Nothing here deletes a worktree, a branch or a file."""
@@ -15,7 +18,8 @@ import subprocess
 
 from .config import log
 
-PROJECT_URL_RE = re.compile(r"^https://hark\.com/project/[0-9A-Za-z][0-9A-Za-z-]{7,}$")
+PROJECT_URL_RE = re.compile(r"^https://hark\.com/project/([0-9A-Za-z][0-9A-Za-z-]{7,})$")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 ALIAS_RE = re.compile(r"^@[A-Za-z0-9_-]{1,32}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 CREATE_NO_WINDOW = 0x08000000
@@ -50,6 +54,11 @@ def git_ok(args, cwd=None):
         return True
     except GitError:
         return False
+
+
+def project_id(url):
+    m = PROJECT_URL_RE.match(url or "")
+    return m.group(1) if m else ""
 
 
 def npath(p):
@@ -149,6 +158,7 @@ def validate(team, managed_ids):
             errs.append("Planner project URL exact https://hark.com/project/<id> hona chahiye")
     if not team.get("workers"):
         errs.append("Kam az kam ek worker chahiye")
+    seen_url = set()
     for w in team.get("workers") or []:
         a = w.get("alias") or ""
         if not ALIAS_RE.match(a):
@@ -164,6 +174,11 @@ def validate(team, managed_ids):
         seen_prof.add(pid)
         if not PROJECT_URL_RE.match(w.get("project_url") or ""):
             errs.append(f"{a}: project URL exact https://hark.com/project/<id> hona chahiye")
+        elif w["project_url"] in seen_url:
+            errs.append(f"{a}: yeh project URL pehle se doosre worker ka hai")
+        seen_url.add(w.get("project_url"))
+        if w.get("account") and not EMAIL_RE.match(w["account"]):
+            errs.append(f"{a}: account '{w['account']}' email nahi")
     return errs
 
 

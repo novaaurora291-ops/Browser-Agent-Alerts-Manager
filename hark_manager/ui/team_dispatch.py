@@ -1,11 +1,18 @@
-"""Team Plan & Safe Dispatch (right-panel drawer) and the Shared Repo Team editor.
+"""Team Plan & Dispatch (right-panel drawer) and the Shared Repo Team editor.
 
-The plan is pasted by hand from ChatGPT (the Planner). It is split into @alias blocks; each worker card shows the
-exact project URL, branch, worktree and the FULL final prompt (worktree path + branch + base SHA first).
-Dispatch sends only to workers whose worktree is clean and on its branch AND whose exact Hark project tab is
-freshly verified (authenticated profile, exact active tab ID, exact URL, ready + empty composer).
-"Sent" shows only when the page shows the new user message; otherwise "Unconfirmed", never re-sent."""
+The plan is pasted by hand from ChatGPT (the Planner) and split into @alias blocks. Every worker's Plan Preview card
+shows its Hark account, Cent profile, exact Hark project URL, branch + base commit and git worktree, and the FULL
+final prompt (worktree path + branch + base SHA first).
+
+Targets:
+  Real Hark   manual only: 'Open Project' shows that profile's exact project tab and 'Copy Task' copies the final
+              prompt; the user pastes and sends it himself. The Manager never types or sends anything here.
+  Local Mock  automatic: Dispatch -> Sent -> Reply received against the local mock Hark (api_dispatch.py). 'Sent'
+              only once the expected account's project shows the message, 'Reply received' only for the reply of
+              that account's selected project.
+  Live API    BLOCKED until Hark grants approved access: no live call is made."""
 import os
+import re
 import threading
 
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
@@ -15,12 +22,25 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPlain
 
 from .widgets import label, button
 from .. import repo_team
+from ..api_dispatch import IN_FLIGHT
 from ..config import log
 
 PILL = {   # kind -> (background, text colour)
     "ok": ("#DDF5D0", "#1E7B1E"), "sent": ("#C9F0B0", "#14620F"), "warn": ("#FFF1D6", "#8A5A00"),
     "block": ("#FDE2E0", "#C62828"), "info": ("#EEF0F2", "#4A5058"), "run": ("#E6F0FF", "#1F5FBF"),
 }
+TARGETS = (("real", "Real Hark \u2014 manual send"), ("mock", "Local Mock \u2014 automatic dispatch"),
+           ("live", "Live API \u2014 BLOCKED"))
+MOCK_PILL = {"verifying": ("run", "\u23F3 Verifying\u2026"), "sending": ("run", "\u23F3 Sending\u2026"),
+             "sent": ("sent", "\u2713 Sent"), "reply": ("ok", "\u2713 Reply received"),
+             "blocked": ("block", "\u26A0 Blocked"), "unconfirmed": ("warn", "\u26A0 Unconfirmed"),
+             "account_changed": ("block", "\u26A0 Account changed"), "no_reply": ("warn", "\u26A0 No reply")}
+FIELDS = ("account", "profile", "project", "branch", "worktree")
+
+
+def breakable(s):
+    """Display copy of a URL / path that may wrap after / \\ - (zero-width spaces). Tooltips keep the exact text."""
+    return re.sub(r"([/\\-])", "\\1\u200b", s or "")
 
 
 class _Relay(QObject):
@@ -34,7 +54,7 @@ class WorkerCard(QFrame):
         self.setObjectName("card")
         v = QVBoxLayout(self)
         v.setContentsMargins(14, 12, 14, 12)
-        v.setSpacing(5)
+        v.setSpacing(4)
         top = QHBoxLayout()
         top.setSpacing(8)
         self.name = label(alias, size=19, bold=True)
@@ -48,18 +68,32 @@ class WorkerCard(QFrame):
         self.detail.setWordWrap(True)
         self.detail.hide()
         v.addWidget(self.detail)
-        self.branch = label("", size=14)
-        self.project = label("", size=12, color="#5B616B")
-        self.project.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.wt = label("", size=12, color="#5B616B")
-        self.wt.setWordWrap(True)
-        v.addWidget(self.branch)
-        v.addWidget(self.project)
-        v.addWidget(self.wt)
+        self.fields = {}
+        for k in FIELDS:
+            f = label("", size=12, color="#3C4148", wrap=True)
+            f.setTextFormat(Qt.PlainText)
+            v.addWidget(f)
+            self.fields[k] = f
+        mh = QHBoxLayout()
+        mh.setSpacing(6)
+        self.mock = label("", size=12, wrap=True)
+        self.mock.setTextFormat(Qt.PlainText)
+        self.b_switch = button("Switch mock account", "link")
+        self.b_switch.setAccessibleName(f"Switch mock account {alias}")
+        self.b_switch.clicked.connect(lambda: panel.switch_mock(alias))
+        mh.addWidget(self.mock, 1)
+        mh.addWidget(self.b_switch, 0, Qt.AlignTop)
+        v.addLayout(mh)
         self.task = QLabel("")
         self.task.setWordWrap(True)
         self.task.setStyleSheet("background:#F3F4F5;border-radius:8px;padding:8px 10px;font-family:Consolas;font-size:13px")
         v.addWidget(self.task)
+        self.reply = QLabel("")
+        self.reply.setWordWrap(True)
+        self.reply.setTextFormat(Qt.PlainText)
+        self.reply.setStyleSheet("background:#EAF7E1;color:#14501A;border-radius:8px;padding:8px 10px;font-size:12px")
+        self.reply.hide()
+        v.addWidget(self.reply)
         self.more = QPushButton("Full prompt \u25B8")
         self.more.setObjectName("link")
         self.more.setCursor(Qt.PointingHandCursor)
@@ -73,11 +107,31 @@ class WorkerCard(QFrame):
         self.full.setAccessibleName(f"Final prompt preview {alias}")
         self.full.hide()
         v.addWidget(self.full)
+        bh = QHBoxLayout()
+        bh.setSpacing(8)
+        self.b_open = button("Open Project", "outline")
+        self.b_open.setAccessibleName(f"Open Project {alias}")
+        self.b_open.clicked.connect(lambda: panel.open_project(alias))
+        self.b_copy = button("Copy Task", "outline")
+        self.b_copy.setAccessibleName(f"Copy Task {alias}")
+        self.b_copy.clicked.connect(lambda: panel.copy_task(alias))
+        bh.addWidget(self.b_open)
+        bh.addWidget(self.b_copy)
+        bh.addStretch(1)
+        v.addLayout(bh)
 
     def toggle(self):
         on = not self.full.isVisible()
         self.full.setVisible(on)
         self.more.setText("Full prompt \u25BE" if on else "Full prompt \u25B8")
+
+    def set_field(self, key, text, bad=False):
+        f = self.fields[key]
+        f.setText(breakable(text))
+        f.setToolTip(text)
+        f.setAccessibleName(f"{key} {self.alias}: {text}")
+        f.setStyleSheet(f"font-size:12px;color:{'#C62828' if bad else '#3C4148'}")
+        f.setVisible(bool(text))
 
     def set_pill(self, kind, text):
         bg, fg = PILL.get(kind, PILL["info"])
@@ -97,11 +151,12 @@ class TeamDispatchPanel(QWidget):
         self.cards = {}
         self.blocks = {}       # alias -> parsed block
         self.issues = []
-        self.verify = {}       # alias -> last tab check result
-        self.vids = {}         # verify id -> (alias, purpose)
-        self.disp = {}         # alias -> dispatch record of the current plan
+        self.verify = {}       # alias -> last read-only tab check (Real Hark)
+        self.vids = {}         # verify id -> alias
+        self.copied = {}       # alias -> the prompt 'Copy Task' put on the clipboard
+        self.click_keys = set()  # mock dispatch keys started by the current Dispatch click
+        self._refused = []     # why workers of the current click were not dispatched
         self.busy = False      # a Dispatch click is in progress (second clicks are ignored)
-        self._want, self._fresh = set(), {}
         self.ready = 0
         self.relay = _Relay()
         self.relay.done.connect(lambda f: f())
@@ -124,6 +179,23 @@ class TeamDispatchPanel(QWidget):
         hb.addStretch(1)
         hb.addWidget(self.b_verify)
         v.addLayout(hb)
+        th = QHBoxLayout()
+        th.addWidget(label("Target", size=14, bold=True))
+        self.target = QComboBox()
+        self.target.setAccessibleName("Dispatch target")
+        for k, t in TARGETS:
+            self.target.addItem(t, k)
+        self.target.model().item(2).setEnabled(False)       # Live API: no approved access
+        self.target.setCurrentIndex(max(0, self.target.findData(ctl.dispatch_target())))
+        self.target.currentIndexChanged.connect(self.on_target)
+        th.addWidget(self.target, 1)
+        v.addLayout(th)
+        self.note = label("", size=12, color="#5B616B", wrap=True)
+        self.note.setAccessibleName("Target note")
+        v.addWidget(self.note)
+        self.live = label("", size=12, color="#C62828", wrap=True)
+        self.live.setAccessibleName("Live API status")
+        v.addWidget(self.live)
         self.paste_lbl = label("Paste ChatGPT Plan", size=14, bold=True)
         v.addWidget(self.paste_lbl)
         self.paste = QPlainTextEdit()
@@ -147,12 +219,12 @@ class TeamDispatchPanel(QWidget):
         self.list.setSpacing(10)
         sc.setWidget(body)
         v.addWidget(sc, 1)
-        self.b_send = QPushButton("\U0001F680 Dispatch to Verified Agents (0 Ready)")
+        self.b_send = QPushButton("\U0001F680 Dispatch to Local Mock (0 Ready)")
         self.b_send.setObjectName("primary")
         self.b_send.setMinimumHeight(52)
         self.b_send.setCursor(Qt.PointingHandCursor)
         self.b_send.setStyleSheet("font-size:16px")
-        self.b_send.setAccessibleName("Dispatch to Verified Agents")
+        self.b_send.setAccessibleName("Dispatch to Local Mock")
         self.b_send.clicked.connect(lambda: self.dispatch())
         v.addWidget(self.b_send)
         self.foot = label("", size=12, color="#5B616B")
@@ -161,9 +233,40 @@ class TeamDispatchPanel(QWidget):
         v.addWidget(self.foot)
         self.t_parse = QTimer(self, singleShot=True, interval=450, timeout=self.parse)
         ctl.verify_done.connect(self.on_verify)
-        ctl.dispatch_update.connect(self.on_dispatch)
+        ctl.api.update.connect(self.on_api)
+        ctl.mock_changed.connect(self.refresh_cards)
         ctl.team_changed.connect(self.on_team)
+        self.apply_mode()
         QTimer.singleShot(1200, self.on_team)
+
+    # ---------- target ----------
+    def mode(self):
+        return self.target.currentData() or "real"
+
+    def on_target(self, _i=0):
+        self.ctl.set_dispatch_target(self.mode())
+        self.verify, self.copied = {}, {}
+        self.apply_mode()
+        self.parse()
+
+    def apply_mode(self):
+        mock = self.mode() == "mock"
+        if mock:
+            m = self.ctl.mock_hark()
+            self.note.setText(f"Local Mock ({m.base_url}): Dispatch \u2192 Sent (jab mock project mein message dikhe) "
+                              "\u2192 Reply received (sirf sahi account + project ka reply).")
+        else:
+            self.note.setText("Real Hark: Manager kuch type ya send nahi karta. 'Open Project' se worker ka exact "
+                              "project kholein, 'Copy Task' se final prompt copy karein, phir Hark mein khud paste "
+                              "karke Send karein.")
+        self.note.setAccessibleName("Target note: " + self.note.text())
+        state, text = self.ctl.live_status()
+        self.live.setText(text)
+        self.live.setStyleSheet(f"font-size:12px;color:{'#1E7B1E' if state == 'approved' else '#C62828'}")
+        self.live.setAccessibleName(text)
+        self.b_send.setVisible(mock)
+        self.b_verify.setVisible(not mock)
+        self._set_foot("" if mock else "Message aap khud send karenge: Manager Real Hark mein kuch nahi bhejta.")
 
     # ---------- team / plan ----------
     def team(self):
@@ -181,6 +284,8 @@ class TeamDispatchPanel(QWidget):
             self.repo.setText("Team set nahi. 'Edit team…' se repo, Planner aur workers chunein.")
         else:
             threading.Thread(target=self._check_wt, daemon=True).start()
+        if self.mode() == "mock":
+            self.ctl.mock_hark()
         self.paste_lbl.setText("Paste ChatGPT Plan (" + ", ".join(w["alias"] for w in t.get("workers") or []) + ")")
         self.parse()
 
@@ -217,10 +322,8 @@ class TeamDispatchPanel(QWidget):
         self.issues = issues
         self.issue_lbl.setText("\n".join("\u26A0 " + i for i in issues))
         self.issue_lbl.setAccessibleName("Plan issues: " + ("; ".join(issues) or "none"))
-        # a new plan text: earlier dispatch results belong to the old text
-        self.disp = {a: r for a, r in self.disp.items() if self._prompt(a) and self.ctl.prompt_key(r["tag"], r["url"], self._prompt(a)) == r.get("key")}
         self.rebuild()
-        if self.blocks and not self.busy:
+        if self.blocks and self.mode() == "real":
             QTimer.singleShot(100, self.verify_all)
 
     def _prompt(self, alias):
@@ -228,6 +331,13 @@ class TeamDispatchPanel(QWidget):
         if not w or not b or not b["known"] or b["dup"] or b["empty"]:
             return ""
         return repo_team.build_prompt(self.team(), w, b["text"])
+
+    def record(self, alias):
+        """The Local Mock dispatch of this worker's CURRENT prompt (None if it was not dispatched)."""
+        w, text = self.worker(alias), self._prompt(alias)
+        if not w or not text:
+            return None
+        return self.ctl.api.find("mock", w["profile_id"], w["project_url"], text)
 
     def rebuild(self):
         while self.list.count():
@@ -249,29 +359,32 @@ class TeamDispatchPanel(QWidget):
         self.list.addStretch(1)
         self.refresh_cards()
 
+    def _mock_problem(self, w):
+        """Why this worker cannot be dispatched to the mock now (kind, text), or None."""
+        wt = self.ctl.worktrees_ok.get(w["alias"])
+        if not wt:
+            return "info", "Checking worktree\u2026"
+        if not wt[0]:
+            return "block", f"\u26A0 Blocked (Worktree: {wt[1]})"
+        if not self.ctl.worker_account(w)[0]:
+            return "block", "\u26A0 Blocked (Account set nahi)"
+        if not repo_team.project_id(w.get("project_url")):
+            return "block", "\u26A0 Blocked (Project URL not set)"
+        return None
+
+    @staticmethod
+    def _rec_pill(rec):
+        kind, text = MOCK_PILL.get(rec["status"], ("block", rec["status"]))
+        if rec["status"] == "sent":
+            return kind, text + " (reply ka intezar)"
+        if rec["reason"] and rec["status"] != "reply":
+            return kind, f"{text} ({rec['reason']})"
+        return kind, text
+
     def status_of(self, alias):
-        """(kind, text, ready) for a worker card."""
+        """(kind, text, ready) for a worker card. ready = Local Mock Dispatch may send it now."""
         a = alias.lower()
         b, w = self.blocks.get(a), self.worker(alias)
-        d = self.disp.get(a)
-        if not d and w and b:
-            # this exact prompt went out before (this session or before a restart): show its own result
-            prev = self.ctl.already_sent(w["profile_id"], w["project_url"], self._prompt(alias))
-            if prev and prev["status"] not in self.ctl.RETRYABLE:
-                d = prev
-        if d and d["status"] in self.ctl.RETRYABLE:
-            # confirmed NOT sent: a fresh Tab Verified after that failure makes it Ready again (retry)
-            v = self.verify.get(a) or {}
-            if not (v.get("ok") and v.get("at", 0) > d.get("done", d.get("t", 0))):
-                why = d.get("reason") or d["status"]
-                return "block", f"\u26A0 Blocked ({why}; Verify tabs = retry)", False
-            d = None
-        if d:
-            st, why = d["status"], d.get("reason") or ""
-            return {"queued": ("run", "\u23F3 Sending\u2026", False), "sending": ("run", "\u23F3 Sending\u2026", False),
-                    "sent": ("sent", "\u2713 Sent", False), "unconfirmed": ("warn", "\u26A0 Unconfirmed", False),
-                    "duplicate": ("block", "\u26A0 Duplicate (not sent)", False),
-                    "expired": ("block", "\u26A0 Not sent (expired)", False)}.get(st, ("block", f"\u26A0 Blocked ({why})", False))
         if not w:
             return "block", "\u26A0 Unknown alias (not in team)", False
         if not b:
@@ -280,142 +393,198 @@ class TeamDispatchPanel(QWidget):
             return "block", "\u26A0 Duplicate blocks", False
         if b["empty"]:
             return "block", "\u26A0 Empty block", False
+        if self.mode() == "mock":
+            rec, problem = self.record(alias), self._mock_problem(w)
+            if rec:
+                kind, text = self._rec_pill(rec)
+                # blocked / unconfirmed may be tried again; once maybe delivered, always with the same idempotency key
+                again = rec["final"] and rec["status"] in ("blocked", "unconfirmed") and not problem
+                return kind, text + (" \u2014 Dispatch = retry" if again else ""), again
+            if problem:
+                return problem[0], problem[1], False
+            return "ok", "\u2713 Ready (Local Mock)", True
         wt = self.ctl.worktrees_ok.get(w["alias"])
         if wt and not wt[0]:
             return "block", f"\u26A0 Blocked (Worktree: {wt[1]})", False
+        prompt = self._prompt(alias)
+        if prompt and self.copied.get(a) == prompt:
+            return "sent", "\U0001F4CB Copied (Hark mein paste karke khud Send karein)", False
         v = self.verify.get(a)
         if not v:
             return "info", "Checking tab\u2026", False
         if not v.get("ok"):
-            return "block", f"\u26A0 Blocked ({v.get('reason')})", False
+            return "warn", f"Tab: {v.get('reason')} (Open Project)", False
         if not wt:
             return "info", "Checking worktree\u2026", False
-        return "ok", "\u2713 Tab Verified", True
+        return "ok", "\u2713 Tab Verified", False
 
     def refresh_cards(self):
-        ready = 0
+        mode, ready = self.mode(), 0
+        base = (self.team().get("base_sha") or "")[:10] or "-"
         for a, c in self.cards.items():
             w, b = self.worker(a), self.blocks.get(a)
+            prompt = self._prompt(a)
             if w:
-                c.branch.setText(f"branch: {w.get('branch') or repo_team.default_branch(w['alias'])}")
-                u = w.get("project_url") or "(project URL not set)"
-                c.project.setText(c.project.fontMetrics().elidedText(u, Qt.ElideMiddle, 300))
-                c.project.setToolTip(u)
-                c.project.setAccessibleName(f"Project {c.alias}: {u}")
-                wt = f"worktree: {w.get('worktree') or '-'}"
-                c.wt.setText(c.wt.fontMetrics().elidedText(wt, Qt.ElideMiddle, 300))
-                c.wt.setToolTip(wt)
+                acc, src = self.ctl.worker_account(w)
+                c.set_field("account", f"Account: {acc} ({'team' if src == 'team' else 'Cent profile ka Hark email'})"
+                            if acc else "Account: set nahi (Edit team\u2026 mein likhein)", bad=not acc)
+                p = self.ctl.by_tag.get(w.get("profile_id") or "")
+                c.set_field("profile", f"Cent profile: {p.name if p else '(missing)'} [{w.get('profile_id') or '-'}]",
+                            bad=not p)
+                u = w.get("project_url") or ""
+                c.set_field("project", "Hark project: " + (u or "(not set)"), bad=not repo_team.project_id(u))
+                c.set_field("branch", f"Branch: {w.get('branch') or repo_team.default_branch(w['alias'])}  \u2022  base {base}")
+                c.set_field("worktree", f"Git worktree: {w.get('worktree') or '(team save par banega)'}",
+                            bad=not w.get("worktree"))
             else:
-                c.branch.setText("not in team")
-                c.project.setText("")
-                c.wt.setText("")
+                c.set_field("account", "not in team", bad=True)
+                for k in FIELDS[1:]:
+                    c.set_field(k, "")
             c.task.setText((b or {}).get("text") or "(no task)")
             c.task.setAccessibleName(f"Task {c.alias}")
-            full = self._prompt(a)
-            c.full.setPlainText(full or "(nothing will be sent)")
+            c.full.setPlainText(prompt or "(nothing will be sent)")
             c.more.setVisible(bool(w))
+            real, mock = mode == "real", mode == "mock"
+            wt = self.ctl.worktrees_ok.get(w["alias"]) if w else None
+            c.b_open.setVisible(real and bool(w))
+            c.b_copy.setVisible(real and bool(w))
+            c.b_open.setEnabled(bool(w) and bool(repo_team.project_id(w.get("project_url"))) and
+                                w.get("profile_id") in self.ctl.by_tag)
+            c.b_copy.setEnabled(bool(prompt) and bool(wt and wt[0]))
+            c.b_copy.setToolTip("Final prompt clipboard par copy hota hai" if c.b_copy.isEnabled() else
+                                "Task ya clean worktree nahi: copy band")
+            c.mock.setVisible(mock and bool(w))
+            c.b_switch.setVisible(mock and bool(w))
+            rec = self.record(a) if mock else None
+            if mock and w:
+                sess, acc = self.ctl.mock_session(w["profile_id"]), self.ctl.worker_account(w)[0]
+                mism = sess != acc
+                txt = f"Mock session: {sess or 'signed out'}" + ("  (account mismatch: dispatch blocked hoga)" if mism else "")
+                c.mock.setText(breakable(txt))
+                c.mock.setAccessibleName(f"mock {c.alias}: {txt}")
+                c.mock.setStyleSheet(f"font-size:12px;color:{'#C62828' if mism else '#1F5FBF'}")
+            c.reply.setVisible(bool(rec and rec["status"] == "reply"))
+            if rec and rec["status"] == "reply":
+                c.reply.setText("Reply: " + rec["reply"])
+                c.reply.setAccessibleName(f"Reply {c.alias}: {rec['reply']}")
             kind, text, ok = self.status_of(c.alias)
             c.set_pill(kind, text)
             ready += ok
         self.ready = ready
-        self.b_send.setText(f"\U0001F680 Dispatch to Verified Agents ({ready} Ready)" if not self.busy else "\u23F3 Dispatching\u2026")
-        self.b_send.setEnabled(ready > 0 and not self.busy)
+        self.b_send.setText(f"\U0001F680 Dispatch to Local Mock ({ready} Ready)" if not self.busy else "\u23F3 Dispatching\u2026")
+        self.b_send.setEnabled(mode == "mock" and ready > 0 and not self.busy)
+        self.b_send.setAccessibleName(f"Dispatch to Local Mock ({ready} Ready)" + (" busy" if self.busy else ""))
         self.b_verify.setEnabled(not self.busy)
+        self.target.setEnabled(not self.busy)
         self.paste.setReadOnly(self.busy)          # the plan is frozen while it is being dispatched
-        self.b_send.setAccessibleName(f"Dispatch to Verified Agents ({ready} Ready)" + (" busy" if self.busy else ""))
 
-    # ---------- tab checks ----------
-    def verify_all(self, purpose="show"):
-        if self.busy:
-            return            # a Dispatch is checking its tabs: a second check would replace its fresh one
+    # ---------- Real Hark: manual send ----------
+    def verify_all(self):
+        """Read-only check of each worker's exact project tab (nothing is typed)."""
+        if self.mode() != "real":
+            return
         if repo_team.is_configured(self.team()):
             threading.Thread(target=self._check_wt, daemon=True).start()     # worktrees too, fresh
         for w in self.team().get("workers") or []:
             a = w["alias"].lower()
-            if a not in self.blocks or a in self.disp and self.disp[a]["status"] in ("queued", "sending"):
+            if a not in self.blocks:
                 continue
             if not repo_team.PROJECT_URL_RE.match(w.get("project_url") or ""):
                 self.verify[a] = {"ok": False, "reason": "Project URL not set"}
                 continue
             self.verify.pop(a, None)
-            vid = self.ctl.verify_tab(w["profile_id"], w["project_url"])
-            self.vids[vid] = (a, purpose)
+            self.vids[self.ctl.verify_tab(w["profile_id"], w["project_url"])] = a
         self.refresh_cards()
 
     def on_verify(self, vid, res):
         if vid not in self.vids:
             return
-        a, purpose = self.vids.pop(vid)
-        self.verify[a] = res
-        if purpose == "dispatch":
-            self._fresh[a] = res
-            if all(x in self._fresh for x in self._want):
-                self._send_verified()
+        self.verify[self.vids.pop(vid)] = res
         self.refresh_cards()
 
-    # ---------- dispatch ----------
+    def open_project(self, alias):
+        w = self.worker(alias)
+        if not w:
+            return
+        ok = self.ctl.open_project(w["profile_id"], w.get("project_url") or "")
+        p = self.ctl.by_tag.get(w["profile_id"])
+        self._set_foot(f"{w['alias']}: {p.name if p else w['profile_id']} mein project khul raha hai \u2014 "
+                       f"{w['project_url']}" if ok else f"{w['alias']}: project URL ya profile ghalat")
+        QTimer.singleShot(2500, self.verify_all)
+
+    def copy_task(self, alias):
+        text = self._prompt(alias)
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        self.copied[alias.lower()] = text
+        log(f"team: copied final prompt for {alias} ({len(text)} chars)")
+        self._set_foot(f"{alias}: final prompt copy ho gaya ({len(text)} chars). Hark mein paste karke khud Send karein.")
+        self.refresh_cards()
+
+    # ---------- Local Mock: automatic dispatch ----------
+    def switch_mock(self, alias):
+        w = self.worker(alias)
+        if not w or self.mode() != "mock":
+            return
+        email = self.ctl.mock_switch_account(w["profile_id"])
+        self._set_foot(f"Mock: Cent profile [{w['profile_id']}] ab {email} par signed in hai.")
+        self.refresh_cards()
+
     def dispatch(self):
-        if self.busy:
+        if self.busy or self.mode() != "mock":
             return                                  # double click: the first click is still working
         self.busy = True
-        self.b_send.setEnabled(False)
-        self.b_send.setText("\u23F3 Dispatching\u2026")
         cand = [a for a, c in self.cards.items() if self.status_of(c.alias)[2]]
-        self._snap = {a: self._prompt(a) for a in cand}      # exactly what the preview showed at this click
-        self.paste.setReadOnly(True)
-        self.b_verify.setEnabled(False)
-        log(f"dispatch click: {len(cand)} candidate(s) {cand}")
-        self._set_foot("Worktrees aur tabs dobara verify ho rahe hain\u2026")
-        threading.Thread(target=self._recheck_wt, args=(cand,), daemon=True).start()
+        snap = {a: self._prompt(a) for a in cand}   # exactly what the preview showed at this click
+        self.click_keys = set()
+        self.ctl.mock_hark()                        # started and synced here, in the UI thread
+        log(f"mock dispatch click: {len(cand)} candidate(s) {cand}")
+        self._set_foot("Worktrees dobara verify ho rahe hain\u2026")
+        self.refresh_cards()
+        threading.Thread(target=self._recheck_wt, args=(cand, snap), daemon=True).start()
 
-    def _recheck_wt(self, cand):
+    def _recheck_wt(self, cand, snap):
         res = {}
         try:
             res = repo_team.verify_all(self.team())
         except Exception as e:
             log(f"dispatch: worktree recheck {e}")
-        self.relay.done.emit(lambda: self._after_wt(cand, res))
+        self.relay.done.emit(lambda: self._after_wt(cand, snap, res))
 
-    def _after_wt(self, cand, res):
+    def _after_wt(self, cand, snap, res):
         self.ctl.worktrees_ok = res
-        ok = [a for a in cand if (res.get(self.worker(a)["alias"]) or (False,))[0]]
-        self._want, self._fresh = set(ok), {}
-        if not ok:
-            return self._finish("Koi worker ready nahi (worktree check).")
-        for a in ok:
+        refused = []
+        for a in cand:
             w = self.worker(a)
-            vid = self.ctl.verify_tab(w["profile_id"], w["project_url"])
-            self.vids[vid] = (a, "dispatch")
-        self.refresh_cards()
-
-    def _send_verified(self):
-        sent = 0
-        for a in sorted(self._want):
-            v, w = self._fresh.get(a) or {}, self.worker(a)
-            if not v.get("ok") or not w:
+            if not w or not (res.get(w["alias"]) or (False, "not checked"))[0]:
+                refused.append(f"{a}: worktree")
                 continue
-            text = (getattr(self, "_snap", None) or {}).get(a) or ""     # the prompt previewed at the click
-            if not text:
-                continue
-            rec = self.ctl.send_prompt(w["profile_id"], v["tab_id"], w["project_url"], text, w["alias"])
+            acc = self.ctl.worker_account(w)[0]
+            rec, why = self.ctl.api.dispatch("mock", w["profile_id"], acc, w["project_url"], snap[a], w["alias"])
             if rec:
-                self.disp[a] = rec
-                sent += 1
-        self._want = set()
-        if not sent:
-            return self._finish("Fresh check mein koi tab verify nahi hua: kuch nahi bheja.")
-        self._set_foot(f"{sent} prompt(s) bheje ja rahe hain\u2026 'Sent' sirf page mein naya message dikhne par.")
+                self.click_keys.add(rec["key"])
+            else:
+                refused.append(f"{w['alias']}: {why}")
+        self._refused = refused
+        if not self.click_keys:
+            return self._finish("Kuch nahi bheja. " + "; ".join(refused))
+        self._set_foot(f"{len(self.click_keys)} prompt(s) Local Mock ko ja rahe hain\u2026 'Sent' sirf mock project "
+                       "mein message dikhne par." + (" Refused: " + "; ".join(refused) if refused else ""))
         self.refresh_cards()
 
-    def on_dispatch(self, did, rec):
-        a = (rec.get("alias") or "").lower()
-        if a in self.disp and self.disp[a]["id"] == did:
-            self.disp[a] = rec
-        if self.busy and not self._want and all(r["status"] not in ("queued", "sending") for r in self.disp.values()):
+    def on_api(self, key, rec):
+        if key in self.click_keys:
+            recs = [r for r in (self.ctl.api.record(k) for k in self.click_keys) if r]
             done = {}
-            for r in self.disp.values():
+            for r in recs:
                 done[r["status"]] = done.get(r["status"], 0) + 1
-            self._finish(", ".join(f"{k}: {n}" for k, n in done.items()))
+            extra = getattr(self, "_refused", [])
+            msg = ", ".join(f"{k}: {n}" for k, n in done.items()) + (". Refused: " + "; ".join(extra) if extra else "")
+            if self.busy and all(r["status"] not in IN_FLIGHT for r in recs):
+                return self._finish(msg)
+            if not self.busy:
+                self._set_foot(msg)
         self.refresh_cards()
 
     def _set_foot(self, msg):
@@ -424,9 +593,8 @@ class TeamDispatchPanel(QWidget):
 
     def _finish(self, msg):
         self.busy = False
-        self._snap = {}
         self._set_foot(msg)
-        log(f"dispatch finished: {msg}")
+        log(f"mock dispatch click finished: {msg}")
         self.refresh_cards()
 
     def edit_team(self):
@@ -542,16 +710,27 @@ class TeamDialog(QDialog):
         url = QLineEdit(w.get("project_url") or "")
         url.setAccessibleName(f"Worker {n} project URL")
         url.setPlaceholderText("https://hark.com/project/<id>")
+        acct = QLineEdit(w.get("account") or "")
+        acct.setAccessibleName(f"Worker {n} Hark account")
         self._complete(url, prof)
-        prof.currentIndexChanged.connect(lambda _=0: self._complete(url, prof))
+        self._account_hint(acct, prof)
+        prof.currentIndexChanged.connect(lambda _=0: (self._complete(url, prof), self._account_hint(acct, prof)))
         rm = button("\u2715", "link")
         rm.setAccessibleName(f"Remove worker {n}")
-        row = {"prof": prof, "alias": alias, "url": url, "keep": {k: w.get(k) for k in ("branch", "worktree") if w.get(k)}}
+        row = {"prof": prof, "alias": alias, "url": url, "acct": acct,
+               "keep": {k: w.get(k) for k in ("branch", "worktree") if w.get(k)}}
         rm.clicked.connect(lambda: self.remove_row(row, h))
-        for x, st in ((prof, 2), (alias, 1), (url, 4), (rm, 0)):
+        for x, st in ((prof, 2), (alias, 1), (url, 4), (acct, 3), (rm, 0)):
             h.addWidget(x, st)
         self.rows_w.addLayout(h)
         self.rows.append(row)
+
+    def _account_hint(self, edit, combo):
+        """Empty = the Hark email this profile saved at setup (shown as the placeholder)."""
+        p = self.ctl.by_tag.get(combo.currentData() or "")
+        email = (p.email if p else "") or ""
+        edit.setPlaceholderText(email or "Hark account email")
+        edit.setToolTip("Is worker ka Hark account. Khali = profile ka saved Hark email" + (f" ({email})" if email else ""))
 
     def _complete(self, edit, combo):
         """Suggest the exact project URLs that profile's Hark sidebar shows."""
@@ -589,6 +768,8 @@ class TeamDialog(QDialog):
             if alias and not alias.startswith("@"):
                 alias = "@" + alias
             w = {"profile_id": r["prof"].currentData() or "", "alias": alias, "project_url": r["url"].text().strip()}
+            if r["acct"].text().strip():
+                w["account"] = r["acct"].text().strip().lower()
             if os.path.normcase(t["repo_path"]) == os.path.normcase(old.get("repo_path") or ""):
                 w.update(r["keep"])
             t["workers"].append(w)

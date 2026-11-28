@@ -349,6 +349,7 @@ class MainWindow(QMainWindow):
         self.dock.release_all()  # every docked Cent window back to the desktop: Windows would close it with us
         self.tray.hide()
         self.ctl.bridge.stop()
+        self.ctl.stop_api()
         e.accept()
         QApplication.quit()
 
