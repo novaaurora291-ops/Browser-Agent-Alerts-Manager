@@ -7,6 +7,7 @@ hark.com. Run from the repo root:  python -m unittest discover -s tests -v"""
 import copy
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -427,6 +428,9 @@ class PanelTests(unittest.TestCase):
 
 
 def tearDownModule():
+    for root, _dirs, files in os.walk(TMP):     # git writes its object files read-only; rmtree cannot delete those
+        for n in files:
+            os.chmod(os.path.join(root, n), stat.S_IWRITE)
     shutil.rmtree(TMP, ignore_errors=True)
 
 
